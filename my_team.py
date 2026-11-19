@@ -17,7 +17,6 @@ even when a position is hidden. Teammates also share sonar.
 import os
 from collections import deque
 
-import contest.capture as capture
 from contest.capture_agents import CaptureAgent
 from contest.game import Actions, Directions
 
@@ -188,11 +187,8 @@ class ContestAgent(CaptureAgent):
         self._move_times = []
         self.my_scared = 0
         self._stall_time = 0
-        try:
-            self.food_to_win = int(capture.TOTAL_FOOD / 2 - capture.MIN_FOOD)
-        except Exception:
-            foods = self.get_food(game_state).as_list()
-            self.food_to_win = max(1, len(foods) - 2)
+        total = len(self.get_food(game_state).as_list()) + len(self.get_food_you_are_defending(game_state).as_list())
+        self.food_to_win = max(1, int(total / 2 - 2))
 
         self.belief = {}
         self.prev_enemy = {}
@@ -1214,7 +1210,9 @@ class ContestAgent(CaptureAgent):
     def _cut_off(self, game_state, my_pos, anchor, report):
         """Chase the bite while they are still eating. Hold the exit only once they turn for home."""
         goal = self._invader_goal(game_state, report, anchor)
-        if goal in self.map.border:
+        # A pacman that is still biting is not heading home. Chase it.
+        eating = self.last_bite is not None and self._completed(game_state) - self.last_bite[1] <= 8
+        if goal in self.map.border and not eating:
             mine = self._home_distances(my_pos)
             their_exit = self.map.dist_exit.get(anchor, 99)
             my_exit = mine.get(goal, self._md(my_pos, goal))
