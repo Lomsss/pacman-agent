@@ -32,7 +32,9 @@ _NOISE = 6
 # makes the search pretend the food does not exist, and the agent wanders.
 _HORIZON = 160
 # Teammates share one module. The lower index clears this at each new game.
-_SHARE = {"sonar": {}, "cover": {}}
+_SHARE = {"sonar": {}, "cover": {}, "hunt": {}}
+# Scared longer than this, a ghost raids instead of shadowing the invader.
+_SCARED_RAID = 12
 
 
 def create_team(first_index, second_index, is_red,
@@ -119,6 +121,7 @@ class _Map:
         ]
         if not self.border:
             self.border = list(self.home)
+        self.border_set = set(self.border)
 
         # Distance back out of a corridor. Junctions and our side are 0.
         # Used when a defender's position cloud is too wide to treat as a wall.
@@ -211,6 +214,7 @@ class ContestAgent(CaptureAgent):
         if self.index == min(self.team):
             _SHARE["sonar"].clear()
             _SHARE["cover"].clear()
+            _SHARE["hunt"].clear()
 
     def final(self, game_state):
         if _DEBUG:
@@ -593,7 +597,13 @@ class ContestAgent(CaptureAgent):
             or (score >= 8 and time_left < 480)
         )
         if self.my_scared > 0 and self.map.on_home(me["pos"]):
-            return "flee" if invaders else "patrol"
+            if not invaders:
+                return "patrol"
+            # A scared ghost cannot stop the invader. Score on their side
+            # while the timer runs, and come back to shadow it near the end.
+            if self.my_scared > _SCARED_RAID and time_left > 120:
+                return "attack"
+            return "hunt"
         if invaders:
             if close_out or self._should_hunt(game_state, me, invaders):
                 return "hunt"
@@ -617,7 +627,7 @@ class ContestAgent(CaptureAgent):
                 return False
             return True
         if self.role == "defense":
-            return my_dist <= mate_dist + 6
+            return True
         return my_dist + 2 < mate_dist
 
     def _should_raid(self, game_state, me, reports, score, time_left):
@@ -1179,8 +1189,6 @@ class ContestAgent(CaptureAgent):
     def _hunt(self, game_state, me, reports):
         if not self.map.on_home(me["pos"]):
             return self._attack(game_state, me, reports, force_home=True)
-        if self.my_scared > 0:
-            return self._flee(game_state, me, reports)
         invaders = [report for report in reports if report["is_pacman"]]
         if not invaders:
             return self._patrol(game_state, me, reports)
@@ -1191,6 +1199,8 @@ class ContestAgent(CaptureAgent):
                 continue
             if anchor in self.map.neighbors[me["pos"]] and self.my_scared == 0:
                 return self._dir(me["pos"], anchor)
+        if self.my_scared > 0 and not any(report["pos"] or report["map_pos"] for report in invaders):
+            return self._flee(game_state, me, reports)
         # Highest payload, then the one we can reach sooner.
         invaders.sort(key=lambda report: (
             -report["carrying"],
@@ -1204,8 +1214,93 @@ class ContestAgent(CaptureAgent):
                 anchor = bite
         if anchor is None or not self.map.on_home(anchor):
             return self._patrol(game_state, me, reports)
-        spot = self._cut_off(game_state, me["pos"], anchor, target)
-        return self._step_home(game_state, me["pos"], spot)
+        _SHARE["hunt"][self.index] = (anchor, self._completed(game_state))
+        return self._pursue(game_state, me, target, anchor)
+
+    def _pursue(self, game_state, me, target, anchor):
+        """Pick the step that leaves the invader the smallest safe region.
+
+        A cell is the invader's if it reaches it strictly before every
+        hunter. Hunters are ghosts only on our side, so their distances stop
+        at the border, and any border exit the invader owns is an escape.
+        A teammate that is a ghost on our side counts as a second hunter, so
+        two hunters close different doors instead of trailing each other.
+        """
+        pos = me["pos"]
+        inv_dist = self._dist_from(anchor)
+        mate = self._teammate_pos(game_state)
+        mate_dist = None
+        if mate is not None and self.map.on_home(mate):
+            mate_state = game_state.get_agent_state(self._teammate_index())
+            if int(mate_state.scared_timer) == 0:
+                mate_dist = self._home_distances(mate)
+        foods = set(_ipos(food) for food in self.get_food_you_are_defending(game_state).as_list())
+        caps = set(_ipos(cap) for cap in self.get_capsules_you_are_defending(game_state))
+        carrying = target["carrying"]
+        scared = self.my_scared
+        legal = game_state.get_legal_actions(self.index)
+        best = None
+        best_key = None
+        for action in legal:
+            nxt = self._nxt(pos, action)
+            if not self.map.on_home(nxt):
+                continue
+            gap = inv_dist.get(nxt, 99)
+            if scared > 0 and gap <= 1 and scared > 1:
+                # Touching them while scared sends us home.
+                continue
+            mine = self._home_distances(nxt)
+            region = 0
+            food_in = 0
+            cap_in = 0
+            escape = 0
+            for cell, d_inv in inv_dist.items():
+                if d_inv > 40:
+                    continue
+                d_h = mine.get(cell, 999)
+                if mate_dist is not None:
+                    d_h = min(d_h, mate_dist.get(cell, 999))
+                if scared > 0:
+                    # We only bite once the timer runs out.
+                    d_h = max(d_h, scared)
+                if d_inv < d_h:
+                    if self.map.on_home(cell):
+                        region += 1
+                        if cell in foods:
+                            food_in += 1
+                        if cell in caps:
+                            cap_in += 1
+                        if cell in self.map.border_set:
+                            escape = 1
+            key = (
+                escape * (10 + 3 * carrying) + cap_in * 25 + food_in * 1.5 + region * 0.2,
+                gap if scared == 0 else abs(gap - 2),
+                1 if action == Directions.STOP else 0,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best = action
+        if best is None:
+            return self._flee(game_state, me, self._reports(game_state, me)) if scared else self._step_home(game_state, pos, anchor)
+        return best
+
+    def _teammate_index(self):
+        for index in self.team:
+            if index != self.index:
+                return index
+        return self.index
+
+    def _dist_from(self, origin):
+        dist = {origin: 0}
+        queue = deque([origin])
+        while queue:
+            cur = queue.popleft()
+            for nxt in self.map.neighbors.get(cur, []):
+                if nxt in dist:
+                    continue
+                dist[nxt] = dist[cur] + 1
+                queue.append(nxt)
+        return dist
 
     def _cut_off(self, game_state, my_pos, anchor, report):
         """Chase the bite while they are still eating. Hold the exit only once they turn for home."""
