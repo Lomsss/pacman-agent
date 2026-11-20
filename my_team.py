@@ -37,7 +37,8 @@ class Maze:
                           if (p[0] + dx, p[1] + dy) in cells] for p in sorted(cells)}
         self.home = {p for p in cells if (p[0] < walls.width // 2) == red}
         self.doors = sorted(p for p in self.home if any(q not in self.home for q, _ in self.edges[p]))
-        # All-pairs BFS on tournament boards. Each row visits each cell once.
+        # Breadth-first search (BFS) gives shortest path lengths on unit-cost edges.
+        # Repeat from each source and cache its distance row for move decisions.
         # On oversized boards keep only crossing rows and use Manhattan elsewhere.
         sources = self.edges if len(cells) <= 650 else self.doors[:32]
         self.rows = {}
@@ -52,6 +53,7 @@ class Maze:
                         queue.append(q)
             self.rows[source] = row
         self.bank = {p: min((self.dist(p, b) for b in self.doors), default=999) for p in cells}
+        # Graph pruning by degree identifies dead ends and their escape mouths.
         # Peel leaves on the enemy side. A raider below a peeled cell must
         # revisit its mouth before it can bank, even in a branching cul-de-sac.
         degree = {p: len(edges) for p, edges in self.edges.items()}
@@ -78,6 +80,8 @@ class Maze:
             return self.rows[q].get(p, 999)
         return manhattan(p, q)
 
+    # Uniform-cost search (Dijkstra) expands the lowest cumulative cost first.
+    # The expansion cap bounds work, and first actions are shared across goals.
     def routes(self, origin, legal, risk, home_only=False):
         """Multi-goal UCS. Path cost is moves plus nonnegative danger in move units.
         First actions let us price all food and all exits with one search."""
@@ -127,6 +131,9 @@ class OpponentModel:
             return ((q in self.maze.home) == invader and manhattan(me, q) > 5 and
                     manhattan(mate, q) > 5 and (not reading or
                     state.get_distance_prob(manhattan(me, q), reading[index]) > 0))
+        # Approximate Bayes filtering predicts a distribution over hidden tiles.
+        # Then use visibility and sonar compatibility, weight missing food, and
+        # normalize the most likely tiles to get the next belief state.
         # Between consecutive grid turns each opponent normally had one move.
         # Standing still also covers an opponent yet to move on the first turn.
         spread = Counter()
@@ -152,7 +159,8 @@ class OpponentModel:
         return list(self.belief.items())[:4], direction
 
     def replies(self, sources, direction, goals, flee):
-        # A bounded one-step expectation (4 sources x 5 replies x 3 goals).
+        # Optional one-step lookahead weights opponent replies by probability.
+        # A bounded forecast uses up to 4 sources, 5 replies and 3 goals.
         # A nearer goal has greater prior weight. A legal step that reduces
         # distance to it is more likely; matching visible motion breaks ties.
         forecast = Counter()
@@ -259,6 +267,7 @@ class CapturePlayer(CaptureAgent):
         moves = (state.data.timeleft + 3) // 4
         # Two invaders leave the far side open. Let a raider already across
         # finish the trip if our sentinel is home; otherwise double-cover.
+        # A rule-based policy switches between raiding and defending.
         double_cover = len(invaders) == 2 and (self.guarding or
                        (not me.is_pacman and mate not in self.maze.home))
         emergency = double_cover or score > 0 and moves < 24
@@ -350,6 +359,7 @@ class CapturePlayer(CaptureAgent):
             estimates[i] and state.get_agent_state(i).scared_timer < 7 for i in self.enemies
         )) else 1
 
+        # Greedy evaluation ranks reachable goals by path cost and weighted features.
         def price(q):
             preference = 0.36 * maze.bank[q] + danger.get(q, 0)
             if q in capsules:
@@ -365,6 +375,7 @@ class CapturePlayer(CaptureAgent):
         return actions[self.goal]
 
     def safe_step(self, p, planned, ghosts, capsules, legal):
+        # One-step threat check avoids a direct capture when a safer move exists.
         # The defender has a turn before we move again. Avoid exposure to
         # one-step capture when a safe neighboring square or wait exists.
         if not ghosts:
@@ -407,6 +418,7 @@ class CapturePlayer(CaptureAgent):
             i, inv, _ = min(sightings, key=priority)
             if costs[inv] <= 1 and state.get_agent_position(i) is not None:
                 return actions[inv]
+            # Shortest-path interception compares both agents' arrival times.
             # Intercept on a shortest corridor to likely loot or the exit.
             # Select the earliest square we reach no later than the invader.
             goals = doors if state.get_agent_state(i).num_carrying >= 2 else self.defended or doors
