@@ -14,6 +14,10 @@ from contest.util import nearest_point
 INF = float("inf")
 STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
          (0, 1, Directions.NORTH), (0, -1, Directions.SOUTH))
+# Blue sees the map rotated by 180 degrees, so its first step to try is the
+# mirror image of red's. Every tie then breaks the same way for both colours.
+BLUE_STEPS = ((-1, 0, Directions.WEST), (1, 0, Directions.EAST),
+              (0, -1, Directions.SOUTH), (0, 1, Directions.NORTH))
 
 
 def create_team(first_index, second_index, is_red, first="Raider", second="Sentinel",
@@ -33,10 +37,14 @@ def manhattan(a, b):
 class Maze:
     def __init__(self, walls, red):
         cells = set(walls.as_list(False))
-        self.edges = {p: [((p[0] + dx, p[1] + dy), action) for dx, dy, action in STEPS
-                          if (p[0] + dx, p[1] + dy) in cells] for p in sorted(cells)}
+        # Tie-breaks follow each team's own view of the map: blue's key is
+        # red's after a 180-degree rotation, so both colours play the same game.
+        self.key = {p: p if red else (walls.width - 1 - p[0], walls.height - 1 - p[1]) for p in cells}
+        steps = STEPS if red else BLUE_STEPS
+        self.edges = {p: [((p[0] + dx, p[1] + dy), action) for dx, dy, action in steps
+                          if (p[0] + dx, p[1] + dy) in cells] for p in self.order(cells)}
         self.home = {p for p in cells if (p[0] < walls.width // 2) == red}
-        self.doors = sorted(p for p in self.home if any(q not in self.home for q, _ in self.edges[p]))
+        self.doors = self.order(p for p in self.home if any(q not in self.home for q, _ in self.edges[p]))
         # Breadth-first search (BFS) gives shortest path lengths on unit-cost edges.
         # Repeat from each source and cache its distance row for move decisions.
         # On oversized boards keep only crossing rows and use Manhattan elsewhere.
@@ -73,6 +81,9 @@ class Maze:
         for p, q in reversed(parents):
             self.mouth[p] = self.mouth.get(q, q)
 
+    def order(self, squares):
+        return sorted(squares, key=self.key.__getitem__)
+
     def dist(self, p, q):
         if p in self.rows:
             return self.rows[p].get(q, 999)
@@ -87,10 +98,10 @@ class Maze:
         First actions let us price all food and all exits with one search."""
         cost = {origin: 0}
         action = {origin: Directions.STOP}
-        queue = [(0, origin)]
+        queue = [(0, self.key[origin], origin)]
         expanded = 0
         while queue and expanded < 850:
-            g, p = heappop(queue)
+            g, _, p = heappop(queue)
             if g != cost[p]:
                 continue
             expanded += 1
@@ -101,7 +112,7 @@ class Maze:
                 if new < cost.get(q, INF):
                     cost[q] = new
                     action[q] = step if p == origin else action[p]
-                    heappush(queue, (new, q))
+                    heappush(queue, (new, self.key[q], q))
         return cost, action
 
 
@@ -241,7 +252,7 @@ class CapturePlayer(CaptureAgent):
                 continue
             if enemy.is_pacman:
                 goals = (self.maze.doors if enemy.num_carrying >= 2 else
-                         sorted(self.defended) or self.maze.doors)
+                         self.maze.order(self.defended) or self.maze.doors)
             else:
                 goals = [q for q in (p, mate) if q not in self.maze.home] or self.maze.doors
             self.forecast[i] = self.models[i].replies(sources, direction, goals,
@@ -262,7 +273,7 @@ class CapturePlayer(CaptureAgent):
         self.defended = defended
         self.bite_age += 1
         if missing:
-            self.bite = min(missing, key=lambda q: self.dist(p, q))
+            self.bite = min(self.maze.order(missing), key=lambda q: self.dist(p, q))
             self.bite_age = 0
         estimates = self.observe(state, p, mate, missing)
         invaders = [i for i in self.enemies if state.get_agent_state(i).is_pacman]
@@ -292,7 +303,7 @@ class CapturePlayer(CaptureAgent):
         maze = self.maze
         me = state.get_agent_state(self.index)
         carried = me.num_carrying
-        food = self.get_food(state).as_list()
+        food = maze.order(self.get_food(state).as_list())
         capsules = set(self.get_capsules(state))
         # A visible defender contests adjacent squares on its next turn.
         # A capsule is consumed before collision testing, so it is a safe step.
@@ -357,7 +368,7 @@ class CapturePlayer(CaptureAgent):
         if me.is_pacman and (cash or recall or not food):
             self.goal = bank
             return self.safe_step(p, actions[bank], active, capsules, legal)
-        candidates = [q for q in food + sorted(capsules) if q in costs]
+        candidates = [q for q in food + maze.order(capsules) if q in costs]
         if not candidates:
             return actions[bank]
         capsule_bonus = 4 if (len(food) < 5 or any(
@@ -461,9 +472,9 @@ class CapturePlayer(CaptureAgent):
                     progress = sum(w * (self.dist(inv, g) - self.dist(q, g))
                                    for q, w in likely_steps.items() if self.dist(inv, q) <= 1)
                     return self.dist(inv, g) - 3 * progress
-                goal = min(sorted(goals), key=goal_cost)
+                goal = min(maze.order(goals), key=goal_cost)
             else:
-                goal = min(sorted(goals), key=lambda q: self.dist(inv, q))
+                goal = min(maze.order(goals), key=lambda q: self.dist(inv, q))
             length = self.dist(inv, goal)
             reachable = [q for q in costs if costs[q] <= self.dist(inv, q) and
                          self.dist(inv, q) + self.dist(q, goal) == length]
