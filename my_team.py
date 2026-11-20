@@ -20,6 +20,10 @@ from collections import deque
 from contest.capture_agents import CaptureAgent
 from contest.game import Actions, Directions
 
+# ============================================================================
+# §1 Configuration and team entry
+# See docs/AGENT_REPORT.md.
+# ============================================================================
 _DEBUG = os.environ.get("PACMAN_DEBUG") == "1"
 _INF = 99
 # Particles below this probability are dropped so the cloud stays local.
@@ -49,6 +53,10 @@ def create_team(first_index, second_index, is_red,
     ]
 
 
+# ============================================================================
+# §10 Utilities (module-level helpers)
+# See docs/AGENT_REPORT.md.
+# ============================================================================
 def _ipos(pos):
     """Grid coordinate. AgentState positions can be floats such as 26.0."""
     if pos is None:
@@ -60,6 +68,10 @@ def _manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+# ============================================================================
+# §2 Map analysis
+# See docs/AGENT_REPORT.md.
+# ============================================================================
 class _Map:
     """Static layout facts. Rebuilt every game; random maps change."""
 
@@ -151,9 +163,14 @@ class _Map:
         return pos[0] >= self.mid
 
 
+# ============================================================================
+# §3 Agent lifecycle and the per-turn pipeline
+# See docs/AGENT_REPORT.md.
+# ============================================================================
 class ContestAgent(CaptureAgent):
     """One agent class, two roles. Roles swap when an invader has to be caught."""
 
+    # --- §3.1 Setup and teardown ---------------------------------------------
     def __init__(self, index, role="offense", time_for_computing=0.1):
         super().__init__(index, time_for_computing)
         self.role = role
@@ -231,6 +248,7 @@ class ContestAgent(CaptureAgent):
             print(line)
         CaptureAgent.final(self, game_state)
 
+    # --- §3.2 Safety wrapper: legal-move check and crash-proof fallback ------
     def choose_action(self, game_state):
         import time
         started = time.perf_counter()
@@ -248,7 +266,7 @@ class ContestAgent(CaptureAgent):
         self._move_times.append(elapsed)
         return action
 
-    # ----------------------------------------------------------------- state
+    # --- §3.3 The turn pipeline -------------------------------------------
 
     def _choose(self, game_state):
         me = self._self_pack(game_state)
@@ -316,6 +334,10 @@ class ContestAgent(CaptureAgent):
                 positions.append(pos)
         return positions
 
+    # ========================================================================
+    # §4 Opponent tracking (grid Bayes filter)
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
     def _update_beliefs(self, game_state, me):
         completed = self._completed(game_state)
         start_index = (self.index - completed) % 4
@@ -389,6 +411,7 @@ class ContestAgent(CaptureAgent):
             }
         self.last_completed = completed
 
+    # --- §4.5 Teammate sonar fusion ------------------------------------------
     def _fuse(self, index, belief, completed):
         """Drop particles the teammate's sonar already rules out.
 
@@ -430,6 +453,7 @@ class ContestAgent(CaptureAgent):
             cursor = (cursor + 1) % 4
         return False
 
+    # --- §4.1 Prediction: move counting and the random-walk motion model -----
     def _moves_between(self, start_index, enemy, begin, end):
         count = 0
         for step in range(begin, end):
@@ -453,6 +477,7 @@ class ContestAgent(CaptureAgent):
                 updated[nxt] = updated.get(nxt, 0.0) + share
         return self._trim(updated)
 
+    # --- §4.2 Correction: sonar ring, negative sight, pacman state -----------
     def _observe(self, belief, my_pos, noisy, team_positions, is_pacman):
         if not belief:
             return {}
@@ -492,6 +517,7 @@ class ContestAgent(CaptureAgent):
         share = 1.0 / float(len(cells))
         return {pos: share for pos in cells}
 
+    # --- §4.3 Pruning --------------------------------------------------------
     def _trim(self, belief):
         if not belief:
             return {}
@@ -505,6 +531,7 @@ class ContestAgent(CaptureAgent):
         total = sum(kept.values())
         return {pos: prob / total for pos, prob in kept.items()}
 
+    # --- §4.4 Hard evidence: eaten food snaps an invader's position ----------
     def _snap_eaten(self, snapshots, eaten):
         """An eaten dot is the square that pacman just landed on.
 
@@ -546,6 +573,7 @@ class ContestAgent(CaptureAgent):
             used_agents.add(index)
             used_food.add(food)
 
+    # --- §4.7 Reports: beliefs summarised for the planners -------------------
     def _reports(self, game_state, me):
         reports = []
         for index in self.opponents:
@@ -592,7 +620,10 @@ class ContestAgent(CaptureAgent):
             })
         return reports
 
-    # ----------------------------------------------------------------- roles
+    # ========================================================================
+    # §5 Role selection
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
 
     def _mode(self, game_state, me, reports):
         invaders = [report for report in reports if report["is_pacman"]]
@@ -663,7 +694,10 @@ class ContestAgent(CaptureAgent):
             return _ipos(game_state.get_agent_position(index))
         return None
 
-    # -------------------------------------------------------------- offense
+    # ========================================================================
+    # §6 Offense planner: carry rules, safety maps, target scoring
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
 
     def _attack(self, game_state, me, reports, raid=False, force_home=False):
         pos = me["pos"]
@@ -830,7 +864,10 @@ class ContestAgent(CaptureAgent):
             return self._commit(game_state, me, ghosts, foods)
         return action
 
-    # ------------------------------------------------------------ tactics
+    # ========================================================================
+    # §7 Tactical look-ahead: alpha-beta veto in close fights
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
 
     def _tactics(self, game_state, me, reports, planned):
         """Alpha-beta look-ahead when a ghost we can see is close.
@@ -979,6 +1016,11 @@ class ContestAgent(CaptureAgent):
                     value -= 15
         return value
 
+    # ========================================================================
+    # §8 Offense fallbacks, anti-stall and border crossing
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
+    # --- §8.1 Fallback when the safe plan finds nothing ----------------------
     def _commit(self, game_state, me, ghosts, foods):
         """Take food when the safe plan has nothing. Only refuse a square a ghost can step onto."""
         pos = me["pos"]
@@ -1026,6 +1068,7 @@ class ContestAgent(CaptureAgent):
             return self._least_danger_step(game_state, me, ghosts, foods)
         return self._dir(pos, self._first(parent, pos, goal))
 
+    # --- §6.3 / §6.4 helpers: escape check and the trip home -----------------
     def _can_escape(self, origin, depth, safety):
         if self.map.on_home(origin):
             return True
@@ -1065,6 +1108,7 @@ class ContestAgent(CaptureAgent):
     def _foods(self, game_state):
         return [_ipos(food) for food in self.get_food(game_state).as_list()]
 
+    # --- §8.2 Anti-stall -----------------------------------------------------
     def _stalled(self, pos):
         if len(self.hist) < 8:
             return False
@@ -1075,6 +1119,7 @@ class ContestAgent(CaptureAgent):
         # Camping our border is defense. Sitting on their side is a wasted trip.
         return kinds == 1 and not self.map.on_home(pos)
 
+    # --- §6.4 Holding the frontier when no path home is safe -----------------
     def _hold_home(self, game_state, me, ghosts):
         """Step toward home, or wait. Never step back into the square we fled."""
         pos = me["pos"]
@@ -1104,6 +1149,7 @@ class ContestAgent(CaptureAgent):
                 best = action
         return best
 
+    # --- §8.2 Anti-stall: commit to a direction ------------------------------
     def _barge(self, game_state, me, reports, suicide=False):
         """Commit to a direction after the agent has been pacing the same squares."""
         pos = me["pos"]
@@ -1153,6 +1199,7 @@ class ContestAgent(CaptureAgent):
                 best = action
         return best
 
+    # --- §8.3 Border crossing ------------------------------------------------
     def _cross(self, game_state, me, reports):
         """Step onto their side when pacing our border has gone on too long."""
         pos = me["pos"]
@@ -1208,6 +1255,7 @@ class ContestAgent(CaptureAgent):
                 best = action
         return best
 
+    # --- §8.1 Last resort ----------------------------------------------------
     def _least_danger_step(self, game_state, me, ghosts, foods):
         pos = me["pos"]
         legal = game_state.get_legal_actions(self.index)
@@ -1253,6 +1301,7 @@ class ContestAgent(CaptureAgent):
                 best_action = action
         return best_action
 
+    # --- §6.2 Safety maps: threat cells, arrival deadlines, safe BFS ---------
     def _likely_ghosts(self, ghosts, cutoff):
         found = []
         for report in ghosts:
@@ -1340,7 +1389,11 @@ class ContestAgent(CaptureAgent):
             return True
         return depth <= safety.get(square, -1)
 
-    # -------------------------------------------------------------- defense
+    # ========================================================================
+    # §9 Defense
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
+    # --- §9.1 Hunting: pick the target ---------------------------------------
 
     def _hunt(self, game_state, me, reports):
         if not self.map.on_home(me["pos"]):
@@ -1373,6 +1426,7 @@ class ContestAgent(CaptureAgent):
         _SHARE["hunt"][self.index] = (anchor, self._completed(game_state))
         return self._pursue(game_state, me, target, anchor)
 
+    # --- §9.2 Region pursuit -------------------------------------------------
     def _pursue(self, game_state, me, target, anchor):
         """Pick the step that leaves the invader the smallest safe region.
 
@@ -1458,6 +1512,7 @@ class ContestAgent(CaptureAgent):
                 queue.append(nxt)
         return dist
 
+    # --- §9.6 Legacy exit cut-off (no longer called; kept for reference) -----
     def _cut_off(self, game_state, my_pos, anchor, report):
         """Chase the bite while they are still eating. Hold the exit only once they turn for home."""
         goal = self._invader_goal(game_state, report, anchor)
@@ -1509,6 +1564,7 @@ class ContestAgent(CaptureAgent):
                 best = square
         return best
 
+    # --- §9.5 Distances that stay on our side --------------------------------
     def _home_distances(self, origin):
         dist = {origin: 0}
         if origin is None or not self.map.on_home(origin):
@@ -1523,6 +1579,7 @@ class ContestAgent(CaptureAgent):
                 queue.append(nxt)
         return dist
 
+    # --- §9.3 Patrol and door cover ------------------------------------------
     def _patrol(self, game_state, me, reports):
         if not self.map.on_home(me["pos"]):
             return self._attack(game_state, me, reports, force_home=True)
@@ -1621,6 +1678,7 @@ class ContestAgent(CaptureAgent):
                 best = spot
         return best
 
+    # --- §9.4 Scared fallback ------------------------------------------------
     def _flee(self, game_state, me, reports):
         threats = []
         for report in reports:
@@ -1648,6 +1706,7 @@ class ContestAgent(CaptureAgent):
                 best_action = action
         return best_action
 
+    # --- §9.5 Movement on our side -------------------------------------------
     def _step_home(self, game_state, src, dst):
         if src == dst:
             legal = game_state.get_legal_actions(self.index)
@@ -1671,7 +1730,10 @@ class ContestAgent(CaptureAgent):
                 best_action = action
         return best_action
 
-    # ----------------------------------------------------------------- utils
+    # ========================================================================
+    # §10 Utilities
+    # See docs/AGENT_REPORT.md.
+    # ========================================================================
 
     def _path(self, start, goal, home_only):
         if start is None or goal is None:
