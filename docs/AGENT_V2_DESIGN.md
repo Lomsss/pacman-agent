@@ -6,23 +6,30 @@ open weaknesses, and leaves out the ideas that cost points when we tried
 them. `my_team.py` is unchanged. The section numbers below (§1 to §9)
 match the numbered banners in the source.
 
+**Verdict: keep `my_team.py` for the contest.** v2 plays at the same level
+as the PR #5 agent but does not beat it. Over 120 games against each other
+it went 53 wins, 8 ties and 59 losses. On the full defaultCapture suite it
+scored 2.77 points a game against 2.75. The details are under Results.
+
 All tests were run on `defaultCapture`, the contest map, unless a line
-says otherwise. Points use 3 per win and 1 per tie, per game.
+says otherwise. Points use 3 per win and 1 per tie, per game. "Screening"
+means 160 games: 80 against Cursor and 80 against the A\* attacker, the
+two opponents that still beat us.
 
 ## What the data told us
 
 | Idea | Evidence | In v2? |
 |---|---|---|
 | Bold raider with risk-priced routes (crowded-stalls) | Beat the previous main agent 59–1–0. Main banked 6.6 dots a game against 10.9, because it was too careful. | Yes (§5) |
-| Ghost risk weights ×2 | Against Cursor, 1.25 → 2.21. ×1.5 and ×3 scored less. | Yes (§1, §5) |
+| Ghost risk weights ×2 | With the stand-off fix (PR #5), Cursor went from 1.25 to 2.21. ×1.5 and ×3 scored less. | Yes (§1, §5) |
 | Breaking stand-offs when not ahead | Part of the PR #5 gain (2.52 → 2.78 overall). Only when level or behind, because a stand-off runs the clock for the side that leads. | Yes (§5) |
 | Interception on the invader's path, door re-cover, bite chase | Crowded-stalls' defence. No defensive change we tried did better. | Yes (§7) |
-| Teammate sonar fusion | Tracking error falls from 5.03 to 4.54 squares against Cursor, and from 5.58 to 4.19 against the A* attacker (10 games each, measured against the true positions). No points change we can measure. | Yes (§3) |
-| Forced-capture search for the sentinel | Never worse in screening (2.31 against 2.29 without it, 160 games each). It rarely fires: about 1 in 50 searches finds a capture we can force. | Yes (§8) |
-| Deep escape search for the raider (worst-case replies of both ghosts, up to 8 rounds) | 1.98 against 2.29 without it. Like main's look-ahead, planning for a perfect guard makes the raider too careful. | No |
-| Short escape search (2 rounds) | Cursor 2.40 → 2.55 but A* 2.17 → 1.70. | No |
-| Scared ghost walks into the invader to respawn unscared | 2.00 and 1.95 against 2.31. The scared sentinel scores more by counter-raiding. | No |
-| Guarding our capsule during interception | A* matchup 1.95 → 1.57 (tested for PR #5). | No |
+| Teammate sonar fusion | Tracking error falls from 5.03 to 4.54 squares against Cursor, and from 5.58 to 4.19 against the A\* attacker (10 games each, measured against the true positions). No points change we can measure. | Yes (§3) |
+| Forced-capture search for the sentinel | No measurable change: 2.31 against 2.29 without it in screening. It rarely fires, because a lone invader can usually step back over the line. Against the A\* attacker, 1 search in 56 found a capture we could force. | Yes (§8) |
+| Deep escape search for the raider (worst-case replies of both ghosts, up to 8 rounds) | Screening: 1.98 with it, 2.29 without. Like main's look-ahead, planning for a perfect guard makes the raider too careful. | No |
+| Short escape search (2 rounds) | Cursor 2.40 → 2.55, but A\* 2.17 → 1.70. | No |
+| Scared ghost walks into the invader to respawn unscared | Screening: 2.00, and 1.95 when limited to defending turns, against 2.31. The invader banked less, but we banked 1.4 dots a game less too, because the scared sentinel stopped counter-raiding. | No |
+| Guarding our capsule during interception | A\* matchup 1.95 → 1.57 (tested for PR #5). | No |
 
 Two facts shaped the defence. Both the A\* attacker and Cursor eat our
 capsule in every game we measured (40 of 40 each). The A\* attacker banks
@@ -135,7 +142,66 @@ finished cleanly.
 
 ## Results
 
-RESULTS_PLACEHOLDER
+"PR #5" is the agent in `my_team.py` on the PR #5 branch: crowded-stalls
+plus the stand-off and risk fixes. Both agents played the same opponents
+on the same maps. W/T/L is wins/ties/losses.
+
+### Full suite on defaultCapture (320 games each)
+
+| Opponent | PR #5: games, W/T/L | PR #5 pts | v2: games, W/T/L | v2 pts | Change |
+|---|---|---|---|---|---|
+| Cursor branch | 40, 27/2/11 | 2.08 | 40, 29/1/10 | 2.20 | +0.12 |
+| astar | 40, 24/7/9 | 1.98 | 40, 26/5/9 | 2.08 | +0.10 |
+| mcts | 20, 19/0/1 | 2.85 | 20, 20/0/0 | 3.00 | +0.15 |
+| minimax | 20, 20/0/0 | 3.00 | 20, 19/1/0 | 2.90 | −0.10 |
+| switcher | 20, 20/0/0 | 3.00 | 20, 19/1/0 | 2.90 | −0.10 |
+| capsule | 40, all wins | 3.00 | 40, all wins | 3.00 | 0 |
+| previous main agent | 20, all wins | 3.00 | 20, all wins | 3.00 | 0 |
+| baseline, double_baseline, rusher, turtle, approxq, camper | 20 each, all wins | 3.00 | 20 each, all wins | 3.00 | 0 |
+| **All** | 320, 290/9/21 | **2.75** | 320, 293/8/19 | **2.77** | **+0.02** |
+
+Adding the screening runs gives 120 games against each of the two hard
+opponents. Against Cursor, PR #5 scored 2.29 and v2 2.43. Against the
+A\* attacker, both scored 2.07. Differences under about 0.2 at this sample
+size are noise.
+
+### Head to head on defaultCapture
+
+| v2 against | Games | W/T/L | Points | Average margin |
+|---|---|---|---|---|
+| PR #5 agent | 120 | 53/8/59 | 1.39 | −0.19 |
+| original crowded-stalls | 40 | 14/6/20 | 1.20 | −0.51 |
+| Cursor branch | 40 | 32/2/6 | 2.45 | +2.75 |
+| previous main agent | 40 | 39/1/0 | 2.95 | +8.33 |
+
+An even match scores 1.5. Against the PR #5 agent, v2 without the
+capture search scored 1.43 and v2 without sonar fusion scored 1.50 (40
+games each), so neither addition decides the match.
+
+### Other maps (10 fixed plus 20 random, 11 styles, 660 games each)
+
+These maps are only a robustness check. Overall: PR #5 2.58, v2 2.62.
+Only two rows moved by more than 0.1:
+
+| Opponent | PR #5 | v2 | Change |
+|---|---|---|---|
+| rusher | 1.88 (21 losses in 60) | 2.37 (12 losses) | +0.48 |
+| astar | 2.23 (14 losses in 60) | 1.93 (18 losses) | −0.30 |
+
+### Reading the results
+
+v2 is level with the PR #5 agent: +0.02 on the contest map's suite, close
+to even head to head, and a mixed picture on other maps. That does not
+meet the bar for replacing `my_team.py`, which needs a clear overall win
+and no clear regression against any style.
+
+The open weakness is the same for both agents: strong attackers eat our
+capsule in every game and bank most of their dots during the scare. None
+of the four counters we tried (capsule guard, scare reset, two escape
+searches) helped. A next attempt should start there. One untested idea:
+our A\* sparring team only heads for the capsule once a ghost is within
+4 squares, so a sentinel that hangs back from an invader near our capsule
+might not trigger it. Whether real opponents behave like that is a guess.
 
 ## Rules and timing
 
@@ -152,10 +218,10 @@ RESULTS_PLACEHOLDER
 ## Reproducing
 
 ```bash
-# full suite on defaultCapture: 13 opponents, 320 games
+# the 11 sparring styles on defaultCapture, 20 games each
 D=$(python3 -c "print(','.join(['defaultCapture'] * 10))")
 python testing/bench.py -a my_team_v2.py -f "$D" -r 0 \
   -o baseline,double_baseline,rusher,turtle,capsule,switcher,approxq,minimax,mcts,astar,camper
-# head to head with the current agent
+# head to head with my_team.py as it is on main, 20 games
 python testing/bench.py -a my_team_v2.py -o git:main -f "$D" -r 0
 ```
