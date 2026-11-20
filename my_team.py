@@ -3,1819 +3,648 @@
 # Licensing Information: Please do not distribute or publish solutions to this
 # project. You are free to use and extend these projects for educational
 # purposes. The Pacman AI projects were developed at UC Berkeley, primarily by
-# John DeNero (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
-# For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
+# John DeNero and Dan Klein. See http://ai.berkeley.edu.
 
-"""Contest capture team.
+"""Capture team for the defaultCapture contest.
 
-Offense paths to food it can still carry home, and crosses a defended
-border instead of pacing it. Defense holds the corridor an invader must
-use, and both agents read carried food, scared timers and pacman state
-even when a position is hidden. Teammates also share sonar.
+The raider treats a ghost as extra path cost, grabs the shallow pellets
+(most food on this map is a dead end just inside a door) and banks two or
+three before a defender can reach that door. The guard holds the door an
+invader is actually using, and stays on it for a step after they retreat.
+A belief cloud never becomes a wall, and a reply search never overrides
+the plan: both of those freeze an attacker against a careful opponent.
 """
 
-import os
-from collections import deque
+from collections import Counter, deque
+from heapq import heappop, heappush
 
 from contest.capture_agents import CaptureAgent
-from contest.game import Actions, Directions
+from contest.game import Directions
+from contest.util import nearest_point
 
-# ============================================================================
-# §1 Configuration and team entry
-# See docs/AGENT_REPORT.md.
-# ============================================================================
-_DEBUG = os.environ.get("PACMAN_DEBUG") == "1"
-_INF = 99
-# Particles below this probability are dropped so the cloud stays local.
-# Keep the reachable set. Dropping low-probability cells deletes the true square
-# once a random walk has spread out, and then food snaps can no longer land.
-_MIN_PROB = 0.0008
-_SIGHT = 5
-_NOISE = 6
-# Random maps can hide the nearest food 90 steps away. A short horizon
-# makes the search pretend the food does not exist, and the agent wanders.
-_HORIZON = 160
-# Teammates share one module. The lower index clears this at each new game.
-_SHARE = {"sonar": {}, "cover": {}, "hunt": {}}
-# Scared longer than this, a ghost raids instead of shadowing the invader.
-_SCARED_RAID = 12
-# Seconds the attacker may spend searching a close fight. The limit is 1 s.
-_SEARCH_TIME = float(os.environ.get("SEARCH_TIME", "0.25"))
-_SEARCH_RANGE = int(os.environ.get("SEARCH_RANGE", "6"))
+_INF = 10 ** 9
+_STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
+          (0, 1, Directions.NORTH), (0, -1, Directions.SOUTH))
+# Teammates share one process. The lower index clears this each game.
+_SHARE = {"sonar": {}, "token": None}
 
 
 def create_team(first_index, second_index, is_red,
-                first="ContestAgent", second="ContestAgent", num_training=0, **kwargs):
-    """Return the pair that plays in the tournament (no extra options are passed)."""
-    return [
-        ContestAgent(first_index, role="offense"),
-        ContestAgent(second_index, role="defense"),
-    ]
+                first="Raider", second="Guard", num_training=0, **kwargs):
+    """Tournament entry. No extra options are passed in."""
+    return [Raider(first_index), Guard(second_index)]
 
 
-# ============================================================================
-# §10 Utilities (module-level helpers)
-# See docs/AGENT_REPORT.md.
-# ============================================================================
-def _ipos(pos):
-    """Grid coordinate. AgentState positions can be floats such as 26.0."""
+def _at(pos):
     if pos is None:
         return None
-    return int(round(pos[0])), int(round(pos[1]))
+    x, y = nearest_point(pos)
+    return int(x), int(y)
 
 
-def _manhattan(a, b):
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+class _Maze:
+    """Static facts for one layout. defaultCapture is small enough to cache."""
 
-
-# ============================================================================
-# §2 Map analysis
-# See docs/AGENT_REPORT.md.
-# ============================================================================
-class _Map:
-    """Static layout facts. Rebuilt every game; random maps change."""
-
-    def __init__(self, agent, game_state):
-        walls = game_state.get_walls()
-        self.width = walls.width
-        self.height = walls.height
-        self.mid = walls.width // 2
-        self.red = agent.red
-        self.neighbors = {}
-        self.positions = []
+    def __init__(self, walls, red):
+        cells = []
         for x in range(walls.width):
             for y in range(walls.height):
-                if walls[x][y]:
-                    continue
-                pos = (x, y)
-                self.positions.append(pos)
-        for pos in self.positions:
+                if not walls[x][y]:
+                    cells.append((x, y))
+        self.cells = set(cells)
+        self.edges = {}
+        for x, y in cells:
             nbs = []
-            x, y = pos
-            for dx, dy in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            for dx, dy, action in _STEPS:
                 nxt = (x + dx, y + dy)
-                if nxt[0] < 0 or nxt[1] < 0 or nxt[0] >= walls.width or nxt[1] >= walls.height:
+                if nxt in self.cells:
+                    nbs.append((nxt, action))
+            self.edges[(x, y)] = nbs
+        self.home = {p for p in self.cells if (p[0] < walls.width // 2) == red}
+        self.doors = sorted(
+            p for p in self.home if any(q not in self.home for q, _ in self.edges[p])
+        )
+        self.rows = {}
+        for source in self.cells:
+            row = {source: 0}
+            queue = deque([source])
+            while queue:
+                pos = queue.popleft()
+                for nxt, _ in self.edges[pos]:
+                    if nxt not in row:
+                        row[nxt] = row[pos] + 1
+                        queue.append(nxt)
+            self.rows[source] = row
+        self.bank = {
+            p: min((self.dist(p, door) for door in self.doors), default=99)
+            for p in self.cells
+        }
+        # Peel enemy-side dead ends. The mouth is the last square you must
+        # recross to get home, which is what a ghost camps.
+        degree = {p: len(nbs) for p, nbs in self.edges.items()}
+        leaves = deque(p for p in self.edges if p not in self.home and degree[p] == 1)
+        parents = []
+        while leaves:
+            pos = leaves.popleft()
+            for nxt, _ in self.edges[pos]:
+                if degree[nxt] <= 0:
                     continue
-                if not walls[nxt[0]][nxt[1]]:
-                    nbs.append(nxt)
-            self.neighbors[pos] = nbs
+                parents.append((pos, nxt))
+                degree[nxt] -= 1
+                if degree[nxt] == 1 and nxt not in self.home:
+                    leaves.append(nxt)
+                break
+            degree[pos] = 0
+        self.mouth = {}
+        for pos, nxt in reversed(parents):
+            self.mouth[pos] = self.mouth.get(nxt, nxt)
 
-        self.home = set()
-        self.enemy_squares = []
-        for pos in self.positions:
-            if self.on_home(pos):
-                self.home.add(pos)
-            else:
-                self.enemy_squares.append(pos)
+    def dist(self, a, b):
+        if a == b:
+            return 0
+        row = self.rows.get(a)
+        if row is None:
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+        return row.get(b, 99)
 
-        # Steps to step off the enemy side. 0 on our side.
-        self.dist_home = {pos: 0 for pos in self.home}
-        queue = deque(self.home)
+    def routes(self, origin, legal, risk, home_only=False):
+        """One search prices every goal. Cost is steps plus danger."""
+        cost = {origin: 0}
+        first = {origin: Directions.STOP}
+        queue = [(0, origin)]
         while queue:
-            pos = queue.popleft()
-            for nxt in self.neighbors[pos]:
-                if nxt in self.dist_home:
+            spent, pos = heappop(queue)
+            if spent != cost[pos]:
+                continue
+            for nxt, action in self.edges[pos]:
+                if home_only and nxt not in self.home:
                     continue
-                self.dist_home[nxt] = self.dist_home[pos] + 1
-                queue.append(nxt)
-
-        # Steps for an invader to reach their own side. 0 already on their side.
-        self.dist_exit = {pos: 0 for pos in self.enemy_squares}
-        queue = deque(self.enemy_squares)
-        while queue:
-            pos = queue.popleft()
-            for nxt in self.neighbors[pos]:
-                if nxt in self.dist_exit:
+                if pos == origin and action not in legal:
                     continue
-                self.dist_exit[nxt] = self.dist_exit[pos] + 1
-                queue.append(nxt)
-
-        self.border = [
-            pos for pos in self.home
-            if any(not self.on_home(nxt) for nxt in self.neighbors[pos])
-        ]
-        if not self.border:
-            self.border = list(self.home)
-        self.border_set = set(self.border)
-
-        # Distance back out of a corridor. Junctions and our side are 0.
-        # Used when a defender's position cloud is too wide to treat as a wall.
-        # Degree 1 is a dead end, not an exit. Only junctions and our side are safe mouths.
-        exits = [
-            pos for pos in self.positions
-            if self.on_home(pos) or len(self.neighbors[pos]) >= 3
-        ]
-        self.tunnel = {pos: 0 for pos in exits}
-        queue = deque(exits)
-        while queue:
-            pos = queue.popleft()
-            for nxt in self.neighbors[pos]:
-                if nxt in self.tunnel:
-                    continue
-                self.tunnel[nxt] = self.tunnel[pos] + 1
-                queue.append(nxt)
-        for pos in self.positions:
-            self.tunnel.setdefault(pos, 30)
-
-    def on_home(self, pos):
-        if self.red:
-            return pos[0] < self.mid
-        return pos[0] >= self.mid
+                new = spent + 1 + risk.get(nxt, 0)
+                if new < cost.get(nxt, _INF):
+                    cost[nxt] = new
+                    first[nxt] = action if pos == origin else first[pos]
+                    heappush(queue, (new, nxt))
+        return cost, first
 
 
-# ============================================================================
-# §3 Agent lifecycle and the per-turn pipeline
-# See docs/AGENT_REPORT.md.
-# ============================================================================
-class ContestAgent(CaptureAgent):
-    """One agent class, two roles. Roles swap when an invader has to be caught."""
+class _Track:
+    """Where one enemy can be. Position only; no reply forecast."""
 
-    # --- §3.1 Setup and teardown ---------------------------------------------
-    def __init__(self, index, role="offense", time_for_computing=0.1):
-        super().__init__(index, time_for_computing)
-        self.role = role
-        self.start = None
-        self.map = None
-        self.belief = {}
-        self.prev_enemy = {}
-        self.spawns = {}
-        self.prev_food = set()
-        self.prev_caps = set()
-        self.last_completed = 0
-        self.initial_time = 1200
-        self.food_to_win = 28
-        self.hist = []
-        self.opponents = []
-        self.team = []
-        self.my_scared = 0
-        self.deaths = 0
-        self.kills = 0
-        self.last_bite = None
-        self._last_me = None
-        self._move_times = []
-        self._stall_time = 0
+    def __init__(self, maze, spawn):
+        self.maze = maze
+        self.spawn = spawn
+        self.belief = {spawn: 1.0}
+        self.pac = False
+        self.carry = 0
+        self.returned = 0
+
+    def update(self, state, index, me, mate, moves, noisy, missing):
+        agent = state.get_agent_state(index)
+        pac = bool(agent.is_pacman)
+        carry = int(agent.num_carrying)
+        returned = int(agent.num_returned)
+        died = self.pac and (not pac) and self.carry > 0 and returned == self.returned
+        self.pac, self.carry, self.returned = pac, carry, returned
+        seen = _at(state.get_agent_position(index))
+        if seen is not None:
+            self.belief = {seen: 1.0}
+            return
+        if died and self.spawn in self.maze.cells:
+            self.belief = {self.spawn: 1.0}
+            return
+        for _ in range(max(0, moves)):
+            self.belief = self._spread(self.belief)
+        kept = {}
+        for pos, mass in self.belief.items():
+            if not self._fits(pos, me, mate, pac, noisy):
+                continue
+            if pos in missing and pac:
+                mass *= 8
+            kept[pos] = mass
+        if not kept:
+            kept = {
+                pos: 1.0 for pos in self.maze.cells
+                if self._fits(pos, me, mate, pac, noisy)
+            }
+        if not kept:
+            kept = {self.spawn: 1.0}
+        # A single hidden pacman standing on the only missing pellet is there.
+        if pac and len(missing) == 1:
+            food = next(iter(missing))
+            if self._fits(food, me, mate, True, noisy):
+                self.belief = {food: 1.0}
+                return
+        ranked = sorted(kept.items(), key=lambda item: item[1], reverse=True)[:48]
+        total = sum(mass for _, mass in ranked) or 1.0
+        self.belief = {pos: mass / total for pos, mass in ranked}
+
+    def _spread(self, belief):
+        spread = Counter()
+        for pos, mass in belief.items():
+            nbs = self.maze.edges.get(pos, [])
+            share = mass / float(1 + len(nbs))
+            spread[pos] += share
+            for nxt, _ in nbs:
+                spread[nxt] += share
+        return spread
+
+    def _fits(self, pos, me, mate, pac, noisy):
+        if (pos in self.maze.home) != pac:
+            return False
+        if abs(pos[0] - me[0]) + abs(pos[1] - me[1]) <= 5:
+            return False
+        if abs(pos[0] - mate[0]) + abs(pos[1] - mate[1]) <= 5:
+            return False
+        if noisy is None:
+            return True
+        return abs((abs(pos[0] - me[0]) + abs(pos[1] - me[1])) - noisy) <= 6
+
+    def top(self, k=4):
+        return sorted(self.belief.items(), key=lambda item: item[1], reverse=True)[:k]
+
+
+class _Player(CaptureAgent):
+    """Shared planner. Subclasses only set whether they start on defense."""
+
+    guard = False
 
     def register_initial_state(self, game_state):
         CaptureAgent.register_initial_state(self, game_state)
-        self.start = _ipos(game_state.get_agent_position(self.index))
-        self.map = _Map(self, game_state)
-        self.opponents = list(self.get_opponents(game_state))
-        self.team = list(self.get_team(game_state))
-        self.initial_time = game_state.data.timeleft or 1200
-        self.last_completed = 0
-        self.hist = []
-        self.deaths = 0
-        self.kills = 0
-        self.last_bite = None
-        self._move_times = []
-        self.my_scared = 0
-        self._stall_time = 0
-        total = len(self.get_food(game_state).as_list()) + len(self.get_food_you_are_defending(game_state).as_list())
-        self.food_to_win = max(1, int(total / 2 - 2))
+        self.maze = _Maze(game_state.get_walls(), self.red)
+        self.dist = self.maze.dist
+        self.enemies = list(self.get_opponents(game_state))
+        self.mate_index = next(i for i in self.get_team(game_state) if i != self.index)
+        self.tracks = {
+            i: _Track(self.maze, _at(game_state.get_initial_agent_position(i)))
+            for i in self.enemies
+        }
+        foods = self.get_food(game_state).as_list()
+        defended = self.get_food_you_are_defending(game_state).as_list()
+        self.quota = (len(foods) + len(defended)) / 2 - 2
+        self.goal = None
+        self.recent = deque(maxlen=10)
+        self.last_time = int(game_state.data.timeleft or 1200)
+        self.watch = self._opening_door(game_state)
+        self.held_door = None
+        self.held_for = 0
+        self._defended = set(map(_at, self.get_food_you_are_defending(game_state).as_list()))
+        walls = game_state.get_walls()
+        token = (self.red, walls.width, walls.height, len(self.maze.cells), self.quota)
+        if self.index == min(self.get_team(game_state)) or _SHARE["token"] != token:
+            _SHARE["token"] = token
+            _SHARE["sonar"] = {}
 
-        self.belief = {}
-        self.prev_enemy = {}
-        self.spawns = {}
-        for index in self.opponents:
-            pos = _ipos(game_state.get_agent_position(index))
-            if pos is None:
-                pos = _ipos(game_state.get_initial_agent_position(index))
-            self.spawns[index] = pos
-            self.belief[index] = {pos: 1.0} if pos is not None else {}
-            state = game_state.get_agent_state(index)
-            self.prev_enemy[index] = {
-                "pac": state.is_pacman,
-                "carry": state.num_carrying,
-                "returned": state.num_returned,
-            }
-        self.prev_food = set(map(_ipos, self.get_food_you_are_defending(game_state).as_list()))
-        self.prev_caps = set(map(_ipos, self.get_capsules_you_are_defending(game_state)))
-        # Lower index registers first, so this never wipes a teammate's fresh data.
-        if self.index == min(self.team):
-            _SHARE["sonar"].clear()
-            _SHARE["cover"].clear()
-            _SHARE["hunt"].clear()
-
-    def final(self, game_state):
-        if _DEBUG:
-            avg = (sum(self._move_times) / len(self._move_times)) if self._move_times else 0
-            returned = sum(game_state.get_agent_state(index).num_returned for index in self.team)
-            line = (
-                f"agent {self.index} role {self.role} deaths {self.deaths} kills {self.kills} "
-                f"returned {returned} avg_ms {avg * 1000:.1f} "
-                f"max_ms {max(self._move_times, default=0) * 1000:.1f}"
-            )
-            print(line)
-        CaptureAgent.final(self, game_state)
-
-    # --- §3.2 Safety wrapper: legal-move check and crash-proof fallback ------
     def choose_action(self, game_state):
-        import time
-        started = time.perf_counter()
+        legal = game_state.get_legal_actions(self.index)
         try:
-            action = self._choose(game_state)
-            legal = game_state.get_legal_actions(self.index)
-            if action not in legal:
-                action = self._fallback(game_state)
+            action = self._choose(game_state, legal)
         except Exception:
-            if _DEBUG:
-                import traceback
-                traceback.print_exc()
-            action = self._fallback(game_state)
-        elapsed = time.perf_counter() - started
-        self._move_times.append(elapsed)
+            action = None
+        if action not in legal:
+            action = self._toward_home(game_state, legal)
         return action
 
-    # --- §3.3 The turn pipeline -------------------------------------------
+    def _choose(self, game_state, legal):
+        me = game_state.get_agent_state(self.index)
+        pos = _at(me.get_position())
+        mate = _at(game_state.get_agent_position(self.mate_index))
+        self.recent.append(pos)
+        missing = self._missing(game_state)
+        estimates = self._observe(game_state, pos, mate, missing)
+        invaders = [i for i in self.enemies if game_state.get_agent_state(i).is_pacman]
+        moves = (int(game_state.data.timeleft) + 3) // 4
+        score = self.get_score(game_state)
+        feast = self._feast(game_state)
+        emergency = (len(invaders) >= 2 and (self.guard or not me.is_pacman)) or (
+            score > 0 and moves < 28
+        )
+        # A second attacker is safe only while nobody is near our doors.
+        # The moment an invader exists, the guard is already on the way home.
+        border_clear = not invaders and not self._border_threat(estimates)
+        assist = self.guard and moves > 45 and not emergency and (feast or border_clear)
+        visible_near = (not me.is_pacman) and any(
+            self.dist(pos, _at(game_state.get_agent_position(i))) <= 2
+            for i in invaders if game_state.get_agent_position(i) is not None
+        )
+        defend = ((self.guard and not assist) or emergency or visible_near) and not me.is_pacman
+        if defend:
+            return self._defend(game_state, pos, mate, invaders, estimates, legal)
+        recall = self.guard and not feast and (bool(invaders) or self._border_threat(estimates))
+        return self._raid(game_state, pos, mate, estimates, legal, moves, recall or emergency)
 
-    def _choose(self, game_state):
-        me = self._self_pack(game_state)
-        self.my_scared = me["scared"]
-        if self.hist and self.hist[-1] != self.start and me["pos"] == self.start and not self.map.on_home(self.hist[-1]):
-            self.deaths += 1
-        self._update_beliefs(game_state, me)
-        reports = self._reports(game_state, me)
-        mode = self._mode(game_state, me, reports)
-        if mode == "hunt":
-            action = self._hunt(game_state, me, reports)
-        elif mode == "flee":
-            action = self._flee(game_state, me, reports)
-        elif mode == "patrol":
-            action = self._patrol(game_state, me, reports)
-        elif mode == "raid":
-            action = self._attack(game_state, me, reports, raid=True)
-        else:
-            action = self._attack(game_state, me, reports, raid=False)
-        if self._stalled(me["pos"]):
-            # A two-step wobble or a sit-in on their side never deposits food.
-            self._stall_time += 1
-            action = self._barge(game_state, me, reports, suicide=self._stall_time >= 5)
-        else:
-            self._stall_time = 0
-        stepped = self._nxt(me["pos"], action)
-        # The safe planner will pace our border forever if a belief cloud covers
-        # the entry. While we are carrying nothing, take the food anyway and
-        # only refuse the squares next to a ghost we can see.
-        if (
-            mode == "attack"
-            and me["carrying"] == 0
-            and self.map.on_home(me["pos"])
-            and self.map.on_home(stepped)
-        ):
-            action = self._cross(game_state, me, reports)
-        if mode in ("attack", "raid") and _SEARCH_TIME > 0:
-            searched = self._tactics(game_state, me, reports, action)
-            if searched is not None:
-                action = searched
-        self.hist.append(me["pos"])
-        if len(self.hist) > 12:
-            self.hist.pop(0)
-        self.prev_food = set(map(_ipos, self.get_food_you_are_defending(game_state).as_list()))
-        self.prev_caps = set(map(_ipos, self.get_capsules_you_are_defending(game_state)))
-        return action
-
-    def _self_pack(self, game_state):
-        state = game_state.get_agent_state(self.index)
-        return {
-            "pos": _ipos(state.get_position()),
-            "scared": int(state.scared_timer),
-            "carrying": int(state.num_carrying),
-            "pac": state.is_pacman,
-        }
-
-    def _completed(self, game_state):
-        return self.initial_time - int(game_state.data.timeleft)
-
-    def _team_positions(self, game_state):
-        positions = []
-        for index in self.team:
-            pos = _ipos(game_state.get_agent_position(index))
-            if pos is not None:
-                positions.append(pos)
-        return positions
-
-    # ========================================================================
-    # §4 Opponent tracking (grid Bayes filter)
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-    def _update_beliefs(self, game_state, me):
-        completed = self._completed(game_state)
-        start_index = (self.index - completed) % 4
+    def _observe(self, game_state, pos, mate, missing):
+        now = int(game_state.data.timeleft)
+        passed = max(0, self.last_time - now)
+        self.last_time = now
         distances = game_state.get_agent_distances() or []
-        team_positions = self._team_positions(game_state)
-        self._last_me = me["pos"]
-        missing = self.prev_food - set(map(_ipos, self.get_food_you_are_defending(game_state).as_list()))
-        missing_caps = self.prev_caps - set(map(_ipos, self.get_capsules_you_are_defending(game_state)))
-        # A capsule eat is also an exact square, same as a food eat.
-        eaten = list(missing) + [cap for cap in missing_caps if cap not in missing]
-        if eaten:
-            self.last_bite = (eaten[-1], completed)
+        noisy = {}
+        estimates = {}
+        for index in self.enemies:
+            moved = Counter()
+            cursor = self.index
+            for _ in range(passed):
+                cursor = (cursor - 1) % 4
+                moved[cursor] += 1
+            moves = moved[index]
+            reading = int(distances[index]) if distances else None
+            noisy[index] = reading
+            self.tracks[index].update(game_state, index, pos, mate, moves, reading, missing)
+            estimates[index] = self.tracks[index].top()
+        _SHARE["sonar"][self.index] = {"at": now, "pos": pos, "noisy": noisy}
+        self._fuse(now, estimates)
+        return estimates
 
-        snapshots = {}
-        for index in self.opponents:
-            state = game_state.get_agent_state(index)
-            snapshots[index] = {
-                "pos": _ipos(game_state.get_agent_position(index)),
-                "pac": bool(state.is_pacman),
-                "scared": int(state.scared_timer),
-                "carry": int(state.num_carrying),
-                "returned": int(state.num_returned),
-                "noisy": int(distances[index]) if distances else 0,
-            }
-
-        moves = {
-            index: self._moves_between(start_index, index, self.last_completed, completed)
-            for index in self.opponents
-        }
-
-        # Death is a teleport. Returning home is not: carried food is scored.
-        for index in self.opponents:
-            prev = self.prev_enemy[index]
-            cur = snapshots[index]
-            if prev["pac"] and not cur["pac"] and prev["carry"] > 0 and cur["returned"] == prev["returned"]:
-                spawn = self.spawns.get(index)
-                self.belief[index] = {spawn: 1.0} if spawn is not None else {}
-                moves[index] = 0
-                self.kills += 1
-
-        for index in self.opponents:
-            for _ in range(moves[index]):
-                self.belief[index] = self._motion(self.belief[index])
-            cur = snapshots[index]
-            if cur["pos"] is not None:
-                self.belief[index] = {cur["pos"]: 1.0}
-            else:
-                observed = self._observe(
-                    self.belief[index], me["pos"], cur["noisy"], team_positions, cur["pac"]
-                )
-                if observed:
-                    self.belief[index] = observed
-                else:
-                    self.belief[index] = self._reseed(
-                        me["pos"], cur["noisy"], team_positions, cur["pac"]
-                    )
-                self.belief[index] = self._fuse(index, self.belief[index], completed)
-
-        self._snap_eaten(snapshots, eaten)
-        _SHARE["sonar"][self.index] = {
-            "completed": completed,
-            "pos": me["pos"],
-            "noisy": {index: snapshots[index]["noisy"] for index in self.opponents},
-        }
-        for index in self.opponents:
-            cur = snapshots[index]
-            self.prev_enemy[index] = {
-                "pac": cur["pac"],
-                "carry": cur["carry"],
-                "returned": cur["returned"],
-            }
-        self.last_completed = completed
-
-    # --- §4.5 Teammate sonar fusion ------------------------------------------
-    def _fuse(self, index, belief, completed):
-        """Drop particles the teammate's sonar already rules out.
-
-        Their reading is from their own square, so the two annuli intersect.
-        One opponent moves between the two observations; allow one extra step
-        for that opponent and keep the old cloud if the filter would erase it.
-        """
-        if not belief:
-            return belief
-        mate = None
+    def _fuse(self, now, estimates):
+        """Drop particles the teammate's sonar already rules out."""
+        pack = None
         mate_index = None
-        for key, pack in _SHARE["sonar"].items():
+        for key, value in _SHARE["sonar"].items():
             if key != self.index:
-                mate = pack
-                mate_index = key
-        if not mate or mate.get("pos") is None:
-            return belief
-        age = completed - int(mate.get("completed", -999))
-        if age <= 0 or age > 3:
-            return belief
-        mate_noisy = mate.get("noisy", {}).get(index)
-        if mate_noisy is None:
-            return belief
-        tol = _NOISE + (1 if self._enemy_moved(index, mate_index) else 0)
-        updated = {}
-        for pos, prob in belief.items():
-            if abs(_manhattan(pos, mate["pos"]) - mate_noisy) > tol:
-                continue
-            updated[pos] = prob
-        if not updated:
-            return belief
-        return self._trim(updated)
-
-    def _enemy_moved(self, enemy, mate_index):
+                pack, mate_index = value, key
+        if not pack or now - pack["at"] <= 0 or now - pack["at"] > 3:
+            return
+        moved = set()
         cursor = mate_index
         while cursor != self.index:
-            if cursor == enemy:
-                return True
+            moved.add(cursor)
             cursor = (cursor + 1) % 4
-        return False
-
-    # --- §4.1 Prediction: move counting and the random-walk motion model -----
-    def _moves_between(self, start_index, enemy, begin, end):
-        count = 0
-        for step in range(begin, end):
-            if (start_index + step) % 4 == enemy:
-                count += 1
-        return count
-
-    def _motion(self, belief):
-        if not belief:
-            return {}
-        updated = {}
-        for pos, prob in belief.items():
-            options = self.map.neighbors.get(pos, [])
-            if not options:
-                updated[pos] = updated.get(pos, 0.0) + prob
+        for index, particles in list(estimates.items()):
+            reading = pack["noisy"].get(index)
+            if reading is None:
                 continue
-            # Stay is legal, but real agents rarely camp a single square forever.
-            options = options + [pos]
-            share = prob / float(len(options))
-            for nxt in options:
-                updated[nxt] = updated.get(nxt, 0.0) + share
-        return self._trim(updated)
-
-    # --- §4.2 Correction: sonar ring, negative sight, pacman state -----------
-    def _observe(self, belief, my_pos, noisy, team_positions, is_pacman):
-        if not belief:
-            return {}
-        updated = {}
-        for pos, prob in belief.items():
-            if not self._sensor_ok(pos, my_pos, noisy, team_positions, is_pacman):
-                continue
-            updated[pos] = prob
-        return self._trim(updated)
-
-    def _sensor_ok(self, pos, my_pos, noisy, team_positions, is_pacman):
-        if abs(_manhattan(pos, my_pos) - noisy) > _NOISE:
-            return False
-        for teammate in team_positions:
-            if _manhattan(pos, teammate) <= _SIGHT:
-                return False
-        on_home = self.map.on_home(pos)
-        if is_pacman and not on_home:
-            return False
-        if (not is_pacman) and on_home:
-            return False
-        return True
-
-    def _reseed(self, my_pos, noisy, team_positions, is_pacman):
-        cells = [
-            pos for pos in self.map.positions
-            if self._sensor_ok(pos, my_pos, noisy, team_positions, is_pacman)
-        ]
-        if not cells:
-            # Keep the side constraint even if the sonar reading is inconsistent.
-            cells = [
-                pos for pos in self.map.positions
-                if self.map.on_home(pos) == is_pacman
+            tol = 7 if index in moved else 6
+            mx, my = pack["pos"]
+            kept = [
+                (pos, mass) for pos, mass in particles
+                if abs(abs(pos[0] - mx) + abs(pos[1] - my) - reading) <= tol
             ]
-        if not cells:
-            cells = list(self.map.positions)
-        share = 1.0 / float(len(cells))
-        return {pos: share for pos in cells}
+            if kept:
+                estimates[index] = kept
 
-    # --- §4.3 Pruning --------------------------------------------------------
-    def _trim(self, belief):
-        if not belief:
-            return {}
-        total = sum(belief.values())
-        if total <= 0:
-            return {}
-        kept = {pos: prob / total for pos, prob in belief.items() if prob / total >= _MIN_PROB}
-        if not kept:
-            top = max(belief.items(), key=lambda item: item[1])
-            return {top[0]: 1.0}
-        total = sum(kept.values())
-        return {pos: prob / total for pos, prob in kept.items()}
+    def _missing(self, game_state):
+        current = set(map(_at, self.get_food_you_are_defending(game_state).as_list()))
+        previous = getattr(self, "_defended", current)
+        self._defended = current
+        return previous - current
 
-    # --- §4.4 Hard evidence: eaten food snaps an invader's position ----------
-    def _snap_eaten(self, snapshots, eaten):
-        """An eaten dot is the square that pacman just landed on.
-
-        The cloud often does not contain that square (a long random walk gets
-        trimmed, or the ghost crossed the map). The bite itself is enough.
-        """
-        if not eaten:
-            return
-        remaining = list(eaten)
-        pacmen = [
-            index for index in self.opponents
-            if snapshots[index]["pac"] and snapshots[index]["pos"] is None
-        ]
-        if not pacmen:
-            return
-
-        def score(index, food):
-            noisy = snapshots[index]["noisy"]
-            sonar = abs(_manhattan(food, self._last_me) - noisy)
-            cloud = self.belief.get(index, {})
-            if cloud:
-                cloud_dist = min(_manhattan(food, pos) for pos in cloud)
-            else:
-                cloud_dist = 0
-            return (0 if sonar <= _NOISE else 1, sonar, cloud_dist)
-
-        # One pacman can eat one dot per move. Assign uniquely, closest first.
-        pairs = []
-        for index in pacmen:
-            for food in remaining:
-                pairs.append((score(index, food), index, food))
-        pairs.sort(key=lambda item: item[0])
-        used_agents = set()
-        used_food = set()
-        for _, index, food in pairs:
-            if index in used_agents or food in used_food:
-                continue
-            self.belief[index] = {food: 1.0}
-            used_agents.add(index)
-            used_food.add(food)
-
-    # --- §4.7 Reports: beliefs summarised for the planners -------------------
-    def _reports(self, game_state, me):
-        reports = []
-        for index in self.opponents:
-            state = game_state.get_agent_state(index)
-            belief = self.belief.get(index, {})
-            visible = _ipos(game_state.get_agent_position(index))
-            exact = visible
-            if exact is None and belief:
-                top_pos, top_prob = max(belief.items(), key=lambda item: item[1])
-                if top_prob >= 0.85 and len(belief) == 1:
-                    exact = top_pos
-            probs = list(belief.values())
-            if probs:
-                peak = max(probs)
-                eff = 1.0 / sum(prob * prob for prob in probs)
-            else:
-                peak = 0.0
-                eff = 999.0
-            map_pos = None
-            if belief:
-                map_pos = max(belief.items(), key=lambda item: item[1])[0]
-            noisy = 0
-            distances = game_state.get_agent_distances()
-            if distances:
-                noisy = int(distances[index])
-            if visible is not None:
-                lower = _manhattan(me["pos"], visible)
-            else:
-                lower = max(_SIGHT + 1, noisy - _NOISE, 0)
-            reports.append({
-                "index": index,
-                "pos": exact,
-                "visible": visible,
-                "is_pacman": bool(state.is_pacman),
-                "scared": int(state.scared_timer),
-                "carrying": int(state.num_carrying),
-                "belief": belief,
-                "map_pos": map_pos,
-                "peak": peak,
-                "eff": eff,
-                "diffuse": len(belief) > 12 or (peak < 0.25 and eff > 12),
-                "lower": lower,
-                "spawn": self.spawns.get(index),
-            })
-        return reports
-
-    # ========================================================================
-    # §5 Role selection
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-
-    def _mode(self, game_state, me, reports):
-        invaders = [report for report in reports if report["is_pacman"]]
-        time_left = int(game_state.data.timeleft)
-        score = self.get_score(game_state)
-        close_out = (
-            (score > 0 and time_left < 170)
-            or (score >= 4 and time_left < 300)
-            or (score >= 8 and time_left < 480)
-        )
-        if self.my_scared > 0 and self.map.on_home(me["pos"]):
-            if not invaders:
-                return "patrol"
-            # A scared ghost cannot stop the invader. Score on their side
-            # while the timer runs, and come back to shadow it near the end.
-            if self.my_scared > _SCARED_RAID and time_left > 120:
-                return "attack"
-            return "hunt"
-        if invaders:
-            if close_out or self._should_hunt(game_state, me, invaders):
-                return "hunt"
-            return "attack"
-        if close_out:
-            return "patrol"
-        if self.role == "defense" and not self._should_raid(game_state, me, reports, score, time_left):
-            return "patrol"
-        if self.role == "defense":
-            return "raid"
-        return "attack"
-
-    def _should_hunt(self, game_state, me, invaders):
-        my_dist = self._invader_dist(me["pos"], invaders)
-        teammate = self._teammate_pos(game_state)
-        mate_dist = self._invader_dist(teammate, invaders) if teammate else 999
-        loaded = max(report["carrying"] for report in invaders)
-        # A fat payload on our side is worth more than another food run.
-        if loaded >= 4 and my_dist <= mate_dist + (0 if self.role == "defense" else 2):
-            if me["carrying"] >= 4 and self.map.dist_home[me["pos"]] <= 3 and mate_dist <= my_dist + 4:
+    def _feast(self, game_state):
+        timers = []
+        for index in self.enemies:
+            agent = game_state.get_agent_state(index)
+            if agent.is_pacman:
                 return False
-            return True
-        if self.role == "defense":
-            return True
-        return my_dist + 2 < mate_dist
+            timers.append(int(agent.scared_timer))
+        return bool(timers) and min(timers) > 8
 
-    def _should_raid(self, game_state, me, reports, score, time_left):
-        # An empty home is a free score for them. Only cross while they are scared.
-        if time_left < 160 or any(report["is_pacman"] for report in reports):
-            return False
-        ghosts = [report for report in reports if not report["is_pacman"]]
-        return bool(ghosts) and all(report["scared"] > 10 for report in ghosts)
-
-    def _invader_dist(self, origin, invaders):
-        if origin is None:
-            return 999
-        best = 999
-        for report in invaders:
-            anchor = report["pos"] or report["map_pos"]
-            if anchor is None:
-                best = min(best, report["lower"] + 4)
-            else:
-                best = min(best, self._md(origin, anchor))
-        return best
-
-    def _teammate_pos(self, game_state):
-        for index in self.team:
-            if index == self.index:
-                continue
-            return _ipos(game_state.get_agent_position(index))
-        return None
-
-    # ========================================================================
-    # §6 Offense planner: carry rules, safety maps, target scoring
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-
-    def _attack(self, game_state, me, reports, raid=False, force_home=False):
-        pos = me["pos"]
-        carrying = me["carrying"]
-        time_left = int(game_state.data.timeleft)
-        dist_home = self.map.dist_home[pos]
-        ghosts = [report for report in reports if not report["is_pacman"]]
-        min_scared = min((report["scared"] for report in ghosts), default=0)
-        any_unscared = any(report["scared"] == 0 for report in ghosts)
-        feast = (not any_unscared) and ghosts and min_scared > 8
-        returned = sum(game_state.get_agent_state(index).num_returned for index in self.team)
-        must_deposit = carrying > 0 and returned + carrying >= self.food_to_win
-        moves_left = time_left / 4.0
-        if not ghosts:
-            # Their side is empty. Sweep, then bank.
-            carry_limit = 10
-        elif raid:
-            carry_limit = 3
-        elif feast:
-            carry_limit = 12
-        elif self.get_score(game_state) < 0 and time_left < 450:
-            carry_limit = 8
-        elif time_left < 180:
-            carry_limit = 2
-        elif any(report["scared"] == 0 and report["lower"] <= 8 for report in ghosts):
-            carry_limit = 3
-        else:
-            # Short trips survive a defender who reaches the only gate.
-            carry_limit = 3
-
-        go_home = must_deposit or (
-            carrying > 0 and (
-                carrying >= carry_limit
-                or dist_home + 1 >= moves_left
-                or (feast and min_scared <= dist_home + 2)
-                or (not feast and dist_home <= 2 and carrying >= 2 and not raid)
-            )
+    def _raid(self, game_state, pos, mate, estimates, legal, moves, recall):
+        me = game_state.get_agent_state(self.index)
+        carried = int(me.num_carrying)
+        food = [_at(bit) for bit in self.get_food(game_state).as_list()]
+        capsules = {_at(cap) for cap in self.get_capsules(game_state)}
+        feast = self._feast(game_state)
+        risk, danger, ghosts = self._pressure(game_state, pos, estimates, food, capsules, feast)
+        for square, count in Counter(self.recent).items():
+            risk[square] += 0.7 * max(0, count - 1)
+        cost, action = self.maze.routes(pos, legal, risk)
+        doors = [door for door in self.maze.doors if door in cost]
+        if not doors:
+            return legal[0]
+        active = self._visible_ghosts(game_state, scared_max=4)
+        bank = min(doors, key=lambda door: self._exit_cost(pos, door, cost, active))
+        returned = sum(game_state.get_agent_state(i).num_returned for i in self.agentsOnTeam)
+        limit = 2 if self.guard else (8 if feast else (4 if self.get_score(game_state) < 0 else 3))
+        near = min((self.dist(pos, bit) for bit in food), default=99)
+        home = self.maze.bank[pos]
+        cash = carried > 0 and (
+            returned + carried >= self.quota
+            or moves <= home + 6
+            or carried >= limit
+            or (not feast and self._exit_threatened(pos, bank, estimates, game_state))
+            or (feast and self._scare_left(game_state) <= home + 2)
+            or near >= home + 4
         )
-        if feast and dist_home >= max(1, min_scared - 2):
-            go_home = True
-        if raid and carrying >= 1 and (any_unscared and min(report["lower"] for report in ghosts) <= dist_home + 2):
-            go_home = True
-        # A known defender as close as the border will eat a loaded pacman.
-        # Bank first; the food is still there next trip.
-        if carrying >= 1 and not feast:
-            for report in ghosts:
-                if report["scared"] == 0 and not report["diffuse"] and report["lower"] <= max(3, dist_home):
-                    go_home = True
-                    break
+        if me.is_pacman and (cash or recall or not food):
+            self.goal = bank
+            return self._safe(pos, action[bank], active, capsules, legal)
+        goals = [bit for bit in food if bit in cost] + [cap for cap in capsules if cap in cost]
+        if feast:
+            for index in self.enemies:
+                seen = _at(game_state.get_agent_position(index))
+                timer = int(game_state.get_agent_state(index).scared_timer)
+                if seen in cost and 1 < timer and self.dist(pos, seen) < timer:
+                    goals.append(seen)
+        if not goals:
+            return self._safe(pos, action[bank], active, capsules, legal)
+        bonus = 6 if (len(food) <= 6 or self._blocked_border(estimates, game_state)) else 2
 
-        unknown = any(report["diffuse"] and report["scared"] == 0 for report in ghosts)
-        lowers = [report["lower"] for report in ghosts if report["scared"] == 0]
-        lower = min(lowers) if lowers else 99
+        def price(goal):
+            value = cost[goal] + 0.8 * self.maze.bank.get(goal, 8) + danger.get(goal, 0)
+            if goal in capsules:
+                value -= bonus
+            elif goal not in food:
+                value -= 7  # a scared ghost, removed for the rest of the feast
+            if self.guard:
+                # Take a different door from the raider. Eight doors, one each.
+                value -= 0.4 * min(14, self.dist(mate, goal))
+            elif mate not in self.maze.home and self.dist(mate, goal) + 1 < self.dist(pos, goal):
+                value += 5
+            if goal == self.goal:
+                value -= 1.4
+            return value
 
-        loose_cut = 0.22 if carrying == 0 else 0.1
-        strict_cut = 0.08
-        loose = self._safety(ghosts, loose_cut, pos, slack=4)
-        strict = self._safety(ghosts, strict_cut, pos, slack=1 if carrying else 3)
-        forward_safety = strict if carrying > 0 else loose
+        self.goal = min(goals, key=price)
+        step = action.get(self.goal, Directions.STOP)
+        if me.is_pacman or pos not in self.maze.home:
+            return self._safe(pos, step, active, capsules, legal)
+        return step if step in legal else legal[0]
 
-        if force_home and not self.map.on_home(pos):
-            for safety in (strict, loose, None):
-                action = self._travel_home(pos, safety)
-                if action is not None:
-                    return action
-            return self._hold_home(game_state, me, ghosts)
-
-        if go_home and not self.map.on_home(pos):
-            action = self._travel_home(pos, strict if not feast else None)
-            if action is not None:
-                return action
-            action = self._travel_home(pos, loose)
-            if action is not None:
-                return action
-            # Stepping back to the square we just left is how a run freezes
-            # one step from home. Hold the frontier instead of wobbling.
-            return self._hold_home(game_state, me, ghosts)
-
-        # Wide clouds are not walls. Alleys are the actual trap, so limit those
-        # and keep taking food that has a junction nearby.
-        # Most pellets sit in dead ends. The sonar gap is how deep a round trip can be.
-        if unknown:
-            max_tunnel = max(2, (lower - 1) // 2)
-            max_tunnel = min(max_tunnel, 8)
-        else:
-            max_tunnel = 99
-        home_cap = 6 if raid else 99
-
-        foods = self._foods(game_state)
-        capsules = [_ipos(cap) for cap in self.get_capsules(game_state)]
-        teammate = self._teammate_pos(game_state)
-        primary = min(self.team) == self.index
-
-        dist, parent = self._bfs(pos, forward_safety)
-        best = None
-        best_cost = 10 ** 9
-        for food in foods:
-            if food not in dist:
-                continue
-            if self.map.dist_home.get(food, 99) > home_cap:
-                continue
-            if self.map.tunnel.get(food, 0) > max_tunnel:
-                continue
-            depth = dist[food]
-            if carrying == 0 and not self._can_escape(food, depth, strict if not feast else None):
-                continue
-            cost = depth + 1.15 * self.map.dist_home[food]
-            if teammate is not None and not primary:
-                if self._md(teammate, food) + 1 < depth:
-                    cost += 4
-            # Break ties toward food far from a known defender.
-            exit_sq = min(self.map.border, key=lambda border: self._md(food, border))
-            for report in ghosts:
-                if report["scared"] > depth + 2:
-                    continue
-                anchor = report["pos"] or (None if report["diffuse"] else report["map_pos"])
-                if anchor is None:
-                    continue
-                # Food behind a door the defender is sitting on is a death, not a score.
-                if self._md(anchor, exit_sq) <= 2:
-                    cost += 7
-                else:
-                    cost -= min(5.0, self._md(food, anchor) * 0.15)
-            if cost < best_cost:
-                best_cost = cost
-                best = food
-
-        # Capsule only when it changes a blocked or scary position.
-        capsule_useful = (best is None) or any(
-            report["scared"] == 0 and report["lower"] <= 10 for report in ghosts
-        )
-        if capsule_useful:
-            for capsule in capsules:
-                if capsule not in dist:
-                    continue
-                cost = dist[capsule] - (10 if best is None else 4)
-                if cost < best_cost:
-                    best_cost = cost
-                    best = capsule
-
-        # Removing a scared defender sends them to spawn for the rest of the feast.
-        if feast or any(report["scared"] > 0 for report in ghosts):
-            for report in ghosts:
-                anchor = report["visible"] or report["pos"]
-                if anchor is None or report["scared"] <= 1:
-                    continue
-                if anchor not in dist:
-                    continue
-                if dist[anchor] >= report["scared"]:
-                    continue
-                if dist[anchor] > 8 and best is not None:
-                    continue
-                cost = dist[anchor] - 8
-                if cost < best_cost:
-                    best_cost = cost
-                    best = anchor
-
-        if best is None:
-            return self._commit(game_state, me, ghosts, foods)
-
-        nxt = self._first(parent, pos, best)
-        action = self._dir(pos, nxt)
-        if self._blocked(nxt):
-            return self._commit(game_state, me, ghosts, foods)
-        return action
-
-    # ========================================================================
-    # §7 Tactical look-ahead: alpha-beta veto in close fights
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-
-    def _tactics(self, game_state, me, reports, planned):
-        """Alpha-beta look-ahead when a ghost we can see is close.
-
-        The model holds our square, the visible ghosts, the dots we eat on
-        the way, what we carry and what we bank. Ghosts move after us and
-        stay on their side. Depth grows one round at a time until the time
-        budget is spent, so a quiet position costs nothing and a fight gets
-        as deep as the clock allows.
-        """
-        import time
-        pos = me["pos"]
+    def _pressure(self, game_state, pos, estimates, food, capsules, feast):
+        risk = Counter()
+        danger = {}
         ghosts = []
-        for report in reports:
-            if report["is_pacman"] or report["visible"] is None:
+        if feast:
+            return risk, danger, ghosts
+        for index, particles in estimates.items():
+            agent = game_state.get_agent_state(index)
+            if agent.is_pacman or int(agent.scared_timer) > 5 or not particles:
                 continue
-            if report["scared"] > 2:
+            seen = _at(game_state.get_agent_position(index))
+            use = [(seen, 1.0)] if seen is not None else particles
+            if seen is None and particles[0][1] < 0.2:
+                use = particles[:1]
+            for ghost, weight in use:
+                ghosts.append(ghost)
+                for square in self.maze.cells:
+                    if square in self.maze.home or square in capsules:
+                        continue
+                    gap = self.dist(ghost, square)
+                    if gap < 5:
+                        risk[square] += weight * (28, 16, 5, 1.5, 0.35)[gap]
+                for bit in food:
+                    mouth = self.maze.mouth.get(bit)
+                    if mouth is None:
+                        continue
+                    slack = self.dist(ghost, mouth) - self.dist(pos, bit) - self.dist(bit, mouth)
+                    if slack <= 1:
+                        danger[bit] = danger.get(bit, 0) + weight * min(14, 2 + 2 * self.dist(bit, mouth))
+        return risk, danger, ghosts
+
+    def _border_threat(self, estimates):
+        for particles in estimates.values():
+            if not particles or particles[0][1] < 0.15:
                 continue
-            if self._md(pos, report["visible"]) <= _SEARCH_RANGE:
-                ghosts.append(report["visible"])
-        if not ghosts:
-            return None
-        if self.map.on_home(pos) and me["carrying"] == 0:
-            # Only worth it at the door: about to cross with a guard nearby.
-            if self.map.dist_home.get(pos, 0) == 0 and pos not in self.map.border_set:
-                return None
-        self._tac_food = set(self._foods(game_state))
-        self._tac_caps = set(_ipos(cap) for cap in self.get_capsules(game_state))
-        self._tac_deadline = time.perf_counter() + _SEARCH_TIME
-        self._tac_planned = self._nxt(pos, planned)
-        start = (pos, tuple(ghosts), frozenset(), me["carrying"], 0)
-        legal = game_state.get_legal_actions(self.index)
-        moves = [(action, self._nxt(pos, action)) for action in legal]
-        ordered = sorted(moves, key=lambda item: 0 if item[1] == self._tac_planned else 1)
-        done = None
-        depth = 1
-        while depth <= 12:
-            scores = {}
-            alpha = -1e9
-            try:
-                for action, nxt in ordered:
-                    value = self._tac_after_me(self._tac_step(start, nxt), depth, alpha, 1e9)
-                    if action == Directions.STOP:
-                        value -= 0.5
-                    scores[action] = value
-                    alpha = max(alpha, value)
-            except TimeoutError:
-                break
-            done = scores
-            if max(scores.values()) <= -900:
-                break
-            depth += 1
-        # Keep the strategic plan unless the search proves it walks into a
-        # catch that another move avoids. The plan is searched first, so its
-        # value is exact; the others are bounds, but the best one is exact.
-        if not done or planned not in done:
-            return None
-        best_action = max(done, key=done.get)
-        if done[planned] > -900 or done[best_action] <= -900:
-            return planned
-        return best_action
-
-    def _tac_step(self, state, nxt):
-        me, ghosts, eaten, carry, banked = state
-        if nxt in ghosts:
-            return None
-        if nxt in self._tac_food and nxt not in eaten:
-            eaten = eaten | {nxt}
-            carry += 1
-        if nxt in self._tac_caps and nxt not in eaten:
-            eaten = eaten | {nxt}
-            return (nxt, (), eaten, carry, banked + 0.5)
-        if self.map.on_home(nxt) and carry:
-            banked += carry
-            carry = 0
-        return (nxt, ghosts, eaten, carry, banked)
-
-    def _tac_after_me(self, state, depth, alpha, beta):
-        """Ghosts' turn: each ghost picks its move, minimising our value."""
-        import time
-        if state is None:
-            return -1000
-        if time.perf_counter() > self._tac_deadline:
-            raise TimeoutError
-        me, ghosts, eaten, carry, banked = state
-        if not ghosts or self.map.on_home(me):
-            return self._tac_value(state, depth)
-        options = []
-        for ghost in ghosts:
-            moves = [cell for cell in self.map.neighbors[ghost] if not self.map.on_home(cell)] + [ghost]
-            moves.sort(key=lambda cell: _manhattan(cell, me))
-            options.append(moves[:4])
-        combos = [()]
-        for moves in options:
-            combos = [combo + (cell,) for combo in combos for cell in moves]
-        value = 1e9
-        for combo in combos:
-            if me in combo:
-                result = -1000 - 5 * carry
-            else:
-                result = self._tac_me((me, combo, eaten, carry, banked), depth - 1, alpha, beta)
-            if result < value:
-                value = result
-            if value <= alpha:
-                return value
-            if value < beta:
-                beta = value
-        return value
-
-    def _tac_me(self, state, depth, alpha, beta):
-        if depth <= 0:
-            return self._tac_value(state, depth)
-        me = state[0]
-        value = -1e9
-        for nxt in self.map.neighbors[me] + [me]:
-            result = self._tac_after_me(self._tac_step(state, nxt), depth, alpha, beta)
-            if result > value:
-                value = result
-            if value >= beta:
-                return value
-            if value > alpha:
-                alpha = value
-        return value
-
-    def _tac_value(self, state, depth):
-        me, ghosts, eaten, carry, banked = state
-        value = 12.0 * banked + 3.0 * carry
-        # Sooner is better: rounds left unused add a little.
-        value += 0.05 * max(depth, 0)
-        home = self.map.dist_home.get(me, 0)
-        value -= 0.25 * carry * home
-        left = [food for food in self._tac_food if food not in eaten]
-        if left and carry < 6:
-            value -= 0.4 * min(_manhattan(me, food) for food in left)
-        if not self.map.on_home(me):
-            for ghost in ghosts:
-                gap = self._md(me, ghost)
-                if gap <= 1:
-                    value -= 400
-                elif gap == 2:
-                    value -= 30
-                elif gap <= 4:
-                    value -= 6.0 / gap
-                # A corridor deeper than the ghost's lead is a trap.
-                if self.map.tunnel.get(me, 0) * 2 >= gap:
-                    value -= 15
-        return value
-
-    # ========================================================================
-    # §8 Offense fallbacks, anti-stall and border crossing
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-    # --- §8.1 Fallback when the safe plan finds nothing ----------------------
-    def _commit(self, game_state, me, ghosts, foods):
-        """Take food when the safe plan has nothing. Only refuse a square a ghost can step onto."""
-        pos = me["pos"]
-        if me["carrying"] > 0 and not self.map.on_home(pos):
-            action = self._travel_home(pos, None)
-            if action is not None:
-                return action
-        threats = []
-        for report in ghosts:
-            if report["scared"] > 4:
-                continue
-            anchor = report["visible"] or report["map_pos"]
-            if anchor is not None:
-                threats.append(anchor)
-        blocked = set()
-        for anchor in threats:
-            for square in self.map.enemy_squares:
-                if self._md(anchor, square) <= 1:
-                    blocked.add(square)
-        safety = None
-        if blocked:
-            safety = {square: (-1 if square in blocked else _INF) for square in self.map.enemy_squares}
-        dist, parent = self._bfs(pos, safety)
-        capsules = [_ipos(cap) for cap in self.get_capsules(game_state)]
-        goal = None
-        best_cost = 10 ** 9
-        for food in foods:
-            if food not in dist:
-                continue
-            cost = dist[food] + 0.35 * self.map.dist_home.get(food, 20) + 0.7 * self.map.tunnel.get(food, 0)
-            if cost < best_cost:
-                best_cost = cost
-                goal = food
-        for capsule in capsules:
-            if capsule not in dist:
-                continue
-            # A stuck offense should take the capsule and then ignore the defender.
-            cost = dist[capsule] - 2
-            if goal is None:
-                cost -= 6
-            if cost < best_cost:
-                best_cost = cost
-                goal = capsule
-        if goal is None:
-            return self._least_danger_step(game_state, me, ghosts, foods)
-        return self._dir(pos, self._first(parent, pos, goal))
-
-    # --- §6.3 / §6.4 helpers: escape check and the trip home -----------------
-    def _can_escape(self, origin, depth, safety):
-        if self.map.on_home(origin):
-            return True
-        if safety is None:
-            return True
-        seen = {origin}
-        queue = deque([(origin, depth)])
-        while queue:
-            pos, dist = queue.popleft()
-            for nxt in self.map.neighbors[pos]:
-                if nxt in seen:
-                    continue
-                nd = dist + 1
-                if nd > _HORIZON:
-                    continue
-                if not self._enter(nxt, nd, safety):
-                    continue
-                if self.map.on_home(nxt):
-                    return True
-                seen.add(nxt)
-                queue.append((nxt, nd))
+            ghost = particles[0][0]
+            if any(self.dist(ghost, door) <= 10 for door in self.maze.doors):
+                return True
         return False
 
-    def _travel_home(self, pos, safety):
-        if self.map.on_home(pos):
-            return Directions.STOP
-        dist, parent = self._bfs(pos, safety)
-        homes = [cell for cell in dist if self.map.on_home(cell)]
-        if not homes:
-            return None
-        goal = min(homes, key=lambda cell: dist[cell])
-        nxt = self._first(parent, pos, goal)
-        if self._blocked(nxt):
-            return None
-        return self._dir(pos, nxt)
-
-    def _foods(self, game_state):
-        return [_ipos(food) for food in self.get_food(game_state).as_list()]
-
-    # --- §8.2 Anti-stall -----------------------------------------------------
-    def _stalled(self, pos):
-        if len(self.hist) < 8:
-            return False
-        recent = self.hist[-8:]
-        kinds = len(set(recent))
-        if kinds == 2:
-            return True
-        # Camping our border is defense. Sitting on their side is a wasted trip.
-        return kinds == 1 and not self.map.on_home(pos)
-
-    # --- §6.4 Holding the frontier when no path home is safe -----------------
-    def _hold_home(self, game_state, me, ghosts):
-        """Step toward home, or wait. Never step back into the square we fled."""
-        pos = me["pos"]
-        legal = game_state.get_legal_actions(self.index)
-        here = self.map.dist_home.get(pos, 99)
-        likely = self._likely_ghosts(ghosts, 0.08)
-        best = Directions.STOP if Directions.STOP in legal else legal[0]
-        best_key = None
-        for action in legal:
-            nxt = self._nxt(pos, action)
-            dist = self.map.dist_home.get(nxt, 99)
-            if dist > here:
+    def _exit_threatened(self, pos, door, estimates, game_state):
+        away = self.dist(pos, door)
+        for index, particles in estimates.items():
+            agent = game_state.get_agent_state(index)
+            if agent.is_pacman or int(agent.scared_timer) > 4 or not particles:
                 continue
-            worst = 0
-            if not (self.map.on_home(nxt) and self.my_scared <= 0):
-                for ghost_pos, scared in likely:
-                    if scared > 1:
-                        continue
-                    gap = self._md(ghost_pos, nxt)
-                    if gap <= 1:
-                        worst += 5
-                    elif gap == 2:
-                        worst += 2
-            key = (1 if worst >= 5 else 0, dist, 1 if action == Directions.STOP else 0)
-            if best_key is None or key < best_key:
-                best_key = key
-                best = action
-        return best
-
-    # --- §8.2 Anti-stall: commit to a direction ------------------------------
-    def _barge(self, game_state, me, reports, suicide=False):
-        """Commit to a direction after the agent has been pacing the same squares."""
-        pos = me["pos"]
-        legal = game_state.get_legal_actions(self.index)
-        visible = [
-            report["visible"]
-            for report in reports
-            if (not report["is_pacman"]) and report["scared"] == 0 and report["visible"] is not None
-        ]
-        if me["carrying"] or not self.map.on_home(pos):
-            goals = None
-            if not me["carrying"]:
-                goals = self._foods(game_state) + [_ipos(cap) for cap in self.get_capsules(game_state)]
-
-            def progress(nxt):
-                if me["carrying"] or not goals:
-                    return self.map.dist_home.get(nxt, 99)
-                return min(self._md(nxt, goal) for goal in goals)
-        else:
-            anchors = []
-            for report in reports:
-                if not report["is_pacman"]:
-                    continue
-                anchor = report["visible"] or report["pos"] or report["map_pos"]
-                if anchor is not None:
-                    anchors.append(anchor)
-            if not anchors and self.map.border:
-                anchors = list(self.map.border)
-
-            def progress(nxt):
-                if not self.map.on_home(nxt):
-                    return 80
-                if not anchors:
-                    return 0
-                return min(self._md(nxt, anchor) for anchor in anchors)
-
-        best = legal[0]
-        best_key = None
-        for action in legal:
-            nxt = self._nxt(pos, action)
-            # Only the square a ghost is standing on is death this turn.
-            # Treating "nearby" as a wall is what freezes a loaded pacman in an alley.
-            on_ghost = 0 if suicide else (1 if nxt in visible else 0)
-            key = (on_ghost, progress(nxt), 1 if action == Directions.STOP else 0, self.map.tunnel.get(nxt, 0))
-            if best_key is None or key < best_key:
-                best_key = key
-                best = action
-        return best
-
-    # --- §8.3 Border crossing ------------------------------------------------
-    def _cross(self, game_state, me, reports):
-        """Step onto their side when pacing our border has gone on too long."""
-        pos = me["pos"]
-        visible = {
-            report["visible"]
-            for report in reports
-            if (not report["is_pacman"]) and report["scared"] == 0 and report["visible"] is not None
-        }
-        blocked = set(visible)
-        for ghost in visible:
-            for square in self.map.enemy_squares:
-                if self._md(ghost, square) <= 1:
-                    blocked.add(square)
-        safety = None
-        if blocked:
-            safety = {square: (-1 if square in blocked else _INF) for square in self.map.enemy_squares}
-        dist, parent = self._bfs(pos, safety)
-        foods = self._foods(game_state)
-        capsules = [_ipos(cap) for cap in self.get_capsules(game_state)]
-        goal = None
-        best_cost = 10 ** 9
-        for food in list(foods) + capsules:
-            if food not in dist:
+            seen = _at(game_state.get_agent_position(index))
+            if seen is None and particles[0][1] < 0.34:
                 continue
-            cost = dist[food] + 0.35 * self.map.dist_home.get(food, 20)
-            if self.map.border:
-                exit_sq = min(self.map.border, key=lambda border: self._md(food, border))
-                for ghost in visible:
-                    if self._md(ghost, exit_sq) <= 2:
-                        cost += 12
-                        break
-            if food in capsules:
-                cost -= 4
-            if cost < best_cost:
-                best_cost = cost
-                goal = food
-        if goal is not None:
-            return self._dir(pos, self._first(parent, pos, goal))
-        legal = game_state.get_legal_actions(self.index)
-        target = min(foods, key=lambda food: self._md(pos, food)) if foods else None
-        best = legal[0]
-        best_key = None
-        for action in legal:
-            nxt = self._nxt(pos, action)
-            if nxt in visible:
+            ghost = seen or particles[0][0]
+            if self.dist(ghost, door) <= away + 1:
+                return True
+        return False
+
+    def _blocked_border(self, estimates, game_state):
+        """A defender sitting on a door is why we spend the trip on a capsule."""
+        near = 0
+        for index, particles in estimates.items():
+            agent = game_state.get_agent_state(index)
+            if agent.is_pacman or int(agent.scared_timer) > 0 or not particles:
                 continue
-            if target is None:
-                key = (0 if not self.map.on_home(nxt) else 1, 1 if action == Directions.STOP else 0)
-            else:
-                key = (self._md(nxt, target), 1 if action == Directions.STOP else 0)
-            if best_key is None or key < best_key:
-                best_key = key
-                best = action
-        return best
+            ghost = _at(game_state.get_agent_position(index)) or particles[0][0]
+            if any(self.dist(ghost, door) <= 2 for door in self.maze.doors):
+                near += 1
+        return near > 0
 
-    # --- §8.1 Last resort ----------------------------------------------------
-    def _least_danger_step(self, game_state, me, ghosts, foods):
-        pos = me["pos"]
-        legal = game_state.get_legal_actions(self.index)
-        likely = self._likely_ghosts(ghosts, 0.08)
-        uncertain = any(report["diffuse"] and report["scared"] == 0 for report in ghosts)
+    def _scare_left(self, game_state):
+        return min(int(game_state.get_agent_state(i).scared_timer) for i in self.enemies)
 
-        def danger(nxt):
-            if self.map.on_home(nxt) and self.my_scared <= 0:
-                return 0
-            worst = 0
-            for ghost_pos, scared in likely:
-                if scared > 1:
-                    continue
-                dist = self._md(ghost_pos, nxt)
-                if dist <= 1:
-                    worst += 5
-                elif dist == 2:
-                    worst += 2
-            if uncertain and not self.map.on_home(nxt):
-                worst += self.map.tunnel.get(nxt, 0)
-            return worst
-
-        best_action = legal[0]
-        best_key = None
-        target = None
-        if foods and not me["carrying"]:
-            target = min(
-                foods,
-                key=lambda food: self._md(pos, food) + self.map.dist_home[food] + 2 * self.map.tunnel.get(food, 0),
-            )
-        for action in legal:
-            nxt = self._nxt(pos, action)
-            if nxt not in self.map.neighbors and nxt != pos and action != Directions.STOP:
-                continue
-            key = (
-                1 if danger(nxt) >= 5 else 0,
-                self.map.dist_home.get(nxt, 99) if me["carrying"] else (0 if target is None else self._md(nxt, target)),
-                danger(nxt),
-                1 if action == Directions.STOP else 0,
-            )
-            if best_key is None or key < best_key:
-                best_key = key
-                best_action = action
-        return best_action
-
-    # --- §6.2 Safety maps: threat cells, arrival deadlines, safe BFS ---------
-    def _likely_ghosts(self, ghosts, cutoff):
+    def _visible_ghosts(self, game_state, scared_max):
         found = []
-        for report in ghosts:
-            if report["diffuse"]:
+        for index in self.enemies:
+            agent = game_state.get_agent_state(index)
+            seen = _at(game_state.get_agent_position(index))
+            if seen is None or agent.is_pacman or int(agent.scared_timer) > scared_max:
                 continue
-            for pos, prob in report["belief"].items():
-                if prob >= cutoff:
-                    found.append((pos, report["scared"]))
-            if report["visible"] is not None:
-                found.append((report["visible"], report["scared"]))
+            found.append(seen)
         return found
 
-    def _threat_cells(self, report, cutoff, origin):
-        """Cells we actually route around.
+    def _exit_cost(self, pos, door, cost, ghosts):
+        if not ghosts:
+            return cost[door]
+        lead = min(self.dist(ghost, door) for ghost in ghosts) - self.dist(pos, door)
+        return cost[door] + 4 * max(0, 2 - lead)
 
-        A wide cloud is a weak guess. Treat it as one estimated square, unless
-        part of the cloud is already close enough to trap us this trip.
-        """
-        if report["visible"] is not None:
-            return [report["visible"]]
-        belief = report["belief"]
-        if not belief:
-            return []
-        likely = [cell for cell, prob in belief.items() if prob >= cutoff]
-        if not likely:
-            likely = [report["map_pos"]] if report["map_pos"] is not None else []
-        near = [cell for cell in likely if self._md(origin, cell) <= 7]
-        if near:
-            return near
-        if report["map_pos"] is not None:
-            return [report["map_pos"]]
-        return likely[:1]
+    def _safe(self, pos, planned, ghosts, capsules, legal):
+        """A ghost we can see gets one move before we do. Don't step into it."""
+        if not ghosts or planned not in legal:
+            return planned if planned in legal else legal[0]
 
-    def _safety(self, ghosts, cutoff, origin, slack=0):
-        """Max arrival step still safe from the ghosts we are willing to believe.
+        def slack(square):
+            if square in self.maze.home or square in capsules:
+                return 8
+            return min(self.dist(ghost, square) for ghost in ghosts)
 
-        slack is extra steps granted against an unseen estimate. A ghost we can
-        see is never given slack, so we still refuse to step next to them.
-        """
-        packs = []
-        for report in ghosts:
-            cells = self._threat_cells(report, cutoff, origin)
-            if cells:
-                packs.append((cells, report["scared"], report["visible"] is not None))
-        if not packs:
-            return None
-        safety = {}
-        for square in self.map.enemy_squares:
-            worst = _INF
-            for cells, scared, seen in packs:
-                local = _INF
-                extra = 0 if seen else slack
-                for cell in cells:
-                    local = min(local, max(scared - 1, self._md(cell, square) + extra - 1))
-                worst = min(worst, local)
-            safety[square] = worst
-        return safety
+        options = [(pos, Directions.STOP)] + self.maze.edges[pos]
+        options = [(square, action) for square, action in options if action in legal]
+        dest = next((square for square, action in options if action == planned), pos)
+        if slack(dest) > 1:
+            return planned
+        safe = [(square, action) for square, action in options if slack(square) > 1]
+        if not safe:
+            return planned
+        return min(safe, key=lambda item: (self.recent.count(item[0]), -slack(item[0])))[1]
 
-    def _bfs(self, start, safety):
-        dist = {start: 0}
-        parent = {start: None}
-        queue = deque([start])
-        while queue:
-            pos = queue.popleft()
-            depth = dist[pos]
-            if depth >= _HORIZON:
-                continue
-            for nxt in self.map.neighbors[pos]:
-                if nxt in dist:
-                    continue
-                if not self._enter(nxt, depth + 1, safety):
-                    continue
-                dist[nxt] = depth + 1
-                parent[nxt] = pos
-                queue.append(nxt)
-        return dist, parent
-
-    def _enter(self, square, depth, safety):
-        if self.map.on_home(square):
-            if self.my_scared <= 0 or depth >= self.my_scared:
-                return True
-            # Still scared on arrival: do not step onto a square an invader can reach.
-            return True
-        if safety is None:
-            return True
-        return depth <= safety.get(square, -1)
-
-    # ========================================================================
-    # §9 Defense
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-    # --- §9.1 Hunting: pick the target ---------------------------------------
-
-    def _hunt(self, game_state, me, reports):
-        if not self.map.on_home(me["pos"]):
-            return self._attack(game_state, me, reports, force_home=True)
-        invaders = [report for report in reports if report["is_pacman"]]
-        if not invaders:
-            return self._patrol(game_state, me, reports)
-        # Standing next to an invader ends the raid this turn. Do that before any plan.
-        for report in invaders:
-            anchor = report["visible"] or report["pos"]
-            if anchor is None or not self.map.on_home(anchor):
-                continue
-            if anchor in self.map.neighbors[me["pos"]] and self.my_scared == 0:
-                return self._dir(me["pos"], anchor)
-        if self.my_scared > 0 and not any(report["pos"] or report["map_pos"] for report in invaders):
-            return self._flee(game_state, me, reports)
-        # Highest payload, then the one we can reach sooner.
-        invaders.sort(key=lambda report: (
-            -report["carrying"],
-            self._invader_dist(me["pos"], [report]),
-        ))
-        target = invaders[0]
-        anchor = target["pos"] or target["map_pos"]
-        if (anchor is None or not self.map.on_home(anchor)) and self.last_bite is not None:
-            bite, when = self.last_bite
-            if self._completed(game_state) - when <= 12:
-                anchor = bite
-        if anchor is None or not self.map.on_home(anchor):
-            return self._patrol(game_state, me, reports)
-        _SHARE["hunt"][self.index] = (anchor, self._completed(game_state))
-        return self._pursue(game_state, me, target, anchor)
-
-    # --- §9.2 Region pursuit -------------------------------------------------
-    def _pursue(self, game_state, me, target, anchor):
-        """Pick the step that leaves the invader the smallest safe region.
-
-        A cell is the invader's if it reaches it strictly before every
-        hunter. Hunters are ghosts only on our side, so their distances stop
-        at the border, and any border exit the invader owns is an escape.
-        A teammate that is a ghost on our side counts as a second hunter, so
-        two hunters close different doors instead of trailing each other.
-        """
-        pos = me["pos"]
-        inv_dist = self._dist_from(anchor)
-        mate = self._teammate_pos(game_state)
-        mate_dist = None
-        if mate is not None and self.map.on_home(mate):
-            mate_state = game_state.get_agent_state(self._teammate_index())
-            if int(mate_state.scared_timer) == 0:
-                mate_dist = self._home_distances(mate)
-        foods = set(_ipos(food) for food in self.get_food_you_are_defending(game_state).as_list())
-        caps = set(_ipos(cap) for cap in self.get_capsules_you_are_defending(game_state))
-        carrying = target["carrying"]
-        scared = self.my_scared
-        legal = game_state.get_legal_actions(self.index)
-        best = None
-        best_key = None
-        for action in legal:
-            nxt = self._nxt(pos, action)
-            if not self.map.on_home(nxt):
-                continue
-            gap = inv_dist.get(nxt, 99)
-            if scared > 0 and gap <= 1 and scared > 1:
-                # Touching them while scared sends us home.
-                continue
-            mine = self._home_distances(nxt)
-            region = 0
-            food_in = 0
-            cap_in = 0
-            escape = 0
-            for cell, d_inv in inv_dist.items():
-                if d_inv > 40:
-                    continue
-                d_h = mine.get(cell, 999)
-                if mate_dist is not None:
-                    d_h = min(d_h, mate_dist.get(cell, 999))
-                if scared > 0:
-                    # We only bite once the timer runs out.
-                    d_h = max(d_h, scared)
-                if d_inv < d_h:
-                    if self.map.on_home(cell):
-                        region += 1
-                        if cell in foods:
-                            food_in += 1
-                        if cell in caps:
-                            cap_in += 1
-                        if cell in self.map.border_set:
-                            escape = 1
-            key = (
-                escape * (10 + 3 * carrying) + cap_in * 25 + food_in * 1.5 + region * 0.2,
-                gap if scared == 0 else abs(gap - 2),
-                1 if action == Directions.STOP else 0,
-            )
-            if best_key is None or key < best_key:
-                best_key = key
-                best = action
-        if best is None:
-            return self._flee(game_state, me, self._reports(game_state, me)) if scared else self._step_home(game_state, pos, anchor)
-        return best
-
-    def _teammate_index(self):
-        for index in self.team:
-            if index != self.index:
-                return index
-        return self.index
-
-    def _dist_from(self, origin):
-        dist = {origin: 0}
-        queue = deque([origin])
-        while queue:
-            cur = queue.popleft()
-            for nxt in self.map.neighbors.get(cur, []):
-                if nxt in dist:
-                    continue
-                dist[nxt] = dist[cur] + 1
-                queue.append(nxt)
-        return dist
-
-    # --- §9.6 Legacy exit cut-off (no longer called; kept for reference) -----
-    def _cut_off(self, game_state, my_pos, anchor, report):
-        """Chase the bite while they are still eating. Hold the exit only once they turn for home."""
-        goal = self._invader_goal(game_state, report, anchor)
-        # A pacman that is still biting is not heading home. Chase it.
-        eating = self.last_bite is not None and self._completed(game_state) - self.last_bite[1] <= 8
-        if goal in self.map.border and not eating:
-            mine = self._home_distances(my_pos)
-            their_exit = self.map.dist_exit.get(anchor, 99)
-            my_exit = mine.get(goal, self._md(my_pos, goal))
-            if my_exit <= their_exit + 1:
-                return goal
-        return self._intercept(my_pos, anchor, goal)
-
-    def _invader_goal(self, game_state, report, anchor):
-        foods = [_ipos(food) for food in self.get_food_you_are_defending(game_state).as_list()]
-        capsules = [_ipos(cap) for cap in self.get_capsules_you_are_defending(game_state)]
-        exit_dist = self.map.dist_exit.get(anchor, 99)
-        food_dist = min((self._md(anchor, food) for food in foods), default=99)
-        cap_dist = min((self._md(anchor, cap) for cap in capsules), default=99)
-        if report["carrying"] >= 4 or (report["carrying"] >= 1 and exit_dist <= food_dist):
-            return min(self.map.border, key=lambda border: self._md(anchor, border))
-        if capsules and cap_dist <= food_dist + 1:
-            return min(capsules, key=lambda cap: self._md(anchor, cap))
-        if foods:
-            return min(foods, key=lambda food: self._md(anchor, food))
-        return anchor
-
-    def _intercept(self, my_pos, inv_pos, goal):
-        path = self._path(inv_pos, goal, home_only=True)
-        if not path:
-            return inv_pos
-        # Maze distance can cut through their side and look faster than we are.
-        mine = self._home_distances(my_pos)
-        best = path[0]
-        best_key = None
-        for step, square in enumerate(path):
-            my_dist = mine.get(square)
-            if my_dist is None:
-                continue
-            late = my_dist - step
-            # Meet them on the earliest square we can reach in time.
-            # If we're always late, lose the least time.
-            if late <= 0:
-                key = (0, step, my_dist)
-            else:
-                key = (1, late, my_dist)
-            if best_key is None or key < best_key:
-                best_key = key
-                best = square
-        return best
-
-    # --- §9.5 Distances that stay on our side --------------------------------
-    def _home_distances(self, origin):
-        dist = {origin: 0}
-        if origin is None or not self.map.on_home(origin):
-            return dist
-        queue = deque([origin])
-        while queue:
-            pos = queue.popleft()
-            for nxt in self.map.neighbors[pos]:
-                if nxt in dist or not self.map.on_home(nxt):
-                    continue
-                dist[nxt] = dist[pos] + 1
-                queue.append(nxt)
-        return dist
-
-    # --- §9.3 Patrol and door cover ------------------------------------------
-    def _patrol(self, game_state, me, reports):
-        if not self.map.on_home(me["pos"]):
-            return self._attack(game_state, me, reports, force_home=True)
-        foods = [_ipos(food) for food in self.get_food_you_are_defending(game_state).as_list()]
-        threats = []
-        for report in reports:
-            anchor = self._offside(report)
-            if anchor is None or not foods:
-                continue
-            food = min(foods, key=lambda cell: self._md(anchor, cell))
-            cross = self._crossing(anchor, food)
-            threats.append((cross, self._md(anchor, cross)))
-        # The teammate who moved earlier already claimed a door. Cover the other one.
-        claimed = self._claimed_cover(game_state)
-        if claimed is not None and len(threats) > 1:
-            others = [item for item in threats if self._md(item[0], claimed) > 3]
-            if others:
-                threats = others
-        if threats:
-            spot = self._cover(me["pos"], threats)
-        elif self.map.border:
-            spot = min(
-                self.map.border,
-                key=lambda border: sum(self._md(border, other) for other in self.map.border),
-            )
-        else:
-            spot = me["pos"]
-        _SHARE["cover"][self.index] = (spot, self._completed(game_state))
-        return self._step_home(game_state, me["pos"], spot)
-
-    def _claimed_cover(self, game_state):
-        now = self._completed(game_state)
-        for index, pack in _SHARE["cover"].items():
-            if index == self.index or not pack:
-                continue
-            spot, when = pack
-            if spot is not None and 0 <= now - when <= 3:
-                return spot
-        return None
-
-    def _offside(self, report):
-        for cand in (report["visible"], report["pos"], report["map_pos"], report["spawn"]):
-            if cand is not None and not self.map.on_home(cand):
-                return cand
-        return None
-
-    def _crossing(self, origin, goal):
-        """First square on our side of the shortest path from origin to goal."""
-        path = self._path(origin, goal, home_only=False)
-        if path:
-            for square in path:
-                if self.map.on_home(square):
-                    return square
-        if self.map.border:
-            return min(self.map.border, key=lambda border: self._md(border, goal))
-        return goal
-
-    def _cover(self, origin, threats):
-        """Wait where the slowest answer to any likely entry is as fast as possible.
-
-        Squares on the way to a single entry all tie, and the last key stands
-        on that entry so a ghost who does not dodge walks into us. Two entries
-        pull the wait back to a square that still reaches both.
-        """
-        unique = {}
-        for cross, eta in threats:
-            if cross is None or not self.map.on_home(cross):
-                continue
-            if cross not in unique or eta < unique[cross]:
-                unique[cross] = eta
-        if not unique:
-            return origin
-        from_cross = {cross: self._home_distances(cross) for cross in unique}
-        mine = self._home_distances(origin)
-        soonest = min(unique, key=lambda cross: unique[cross])
-        best = origin
-        best_key = None
-        for spot in mine:
-            worst = None
-            total = 0
-            feasible = True
-            for cross, eta in unique.items():
-                gap = from_cross[cross].get(spot)
-                if gap is None:
-                    feasible = False
-                    break
-                late = mine[spot] + gap - eta
-                total += late
-                if worst is None or late > worst:
-                    worst = late
-            if not feasible or worst is None:
-                continue
-            key = (worst, total, from_cross[soonest].get(spot, 99))
-            if best_key is None or key < best_key:
-                best_key = key
-                best = spot
-        return best
-
-    # --- §9.4 Scared fallback ------------------------------------------------
-    def _flee(self, game_state, me, reports):
-        threats = []
-        for report in reports:
-            if not report["is_pacman"]:
-                continue
-            anchor = report["pos"] or report["map_pos"]
-            if anchor is not None:
-                threats.append(anchor)
-        legal = game_state.get_legal_actions(self.index)
-        best_action = legal[0]
-        best_key = None
-        for action in legal:
-            nxt = self._nxt(me["pos"], action)
-            if not self.map.on_home(nxt) and action != Directions.STOP:
-                # Leaving while scared is right only when every enemy is already over here,
-                # which means their side has no ghost. _mode sends us to attack in that case.
-                continue
-            if threats:
-                gap = min(self._md(nxt, threat) for threat in threats)
-            else:
-                gap = 0
-            key = (-gap, 1 if action == Directions.STOP else 0)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_action = action
-        return best_action
-
-    # --- §9.5 Movement on our side -------------------------------------------
-    def _step_home(self, game_state, src, dst):
-        if src == dst:
-            legal = game_state.get_legal_actions(self.index)
-            return Directions.STOP if Directions.STOP in legal else legal[0]
-        path = self._path(src, dst, home_only=True)
-        if path and len(path) >= 2:
-            nxt = path[1]
-            if not self._blocked(nxt):
-                return self._dir(src, nxt)
-        # Greedy step that stays on our side if the pocket is walled off.
-        legal = game_state.get_legal_actions(self.index)
-        best_action = legal[0]
-        best_dist = 10 ** 9
-        for action in legal:
-            nxt = self._nxt(src, action)
-            if not self.map.on_home(nxt):
-                continue
-            dist = self._md(nxt, dst)
-            if dist < best_dist:
-                best_dist = dist
-                best_action = action
-        return best_action
-
-    # ========================================================================
-    # §10 Utilities
-    # See docs/AGENT_REPORT.md.
-    # ========================================================================
-
-    def _path(self, start, goal, home_only):
-        if start is None or goal is None:
-            return None
-        if start == goal:
-            return [start]
-
-        def allowed(pos):
-            return self.map.on_home(pos) if home_only else True
-
-        if not allowed(start) or not allowed(goal):
-            return None
-        queue = deque([start])
-        parent = {start: None}
-        while queue:
-            pos = queue.popleft()
-            for nxt in self.map.neighbors[pos]:
-                if nxt in parent or not allowed(nxt):
-                    continue
-                parent[nxt] = pos
-                if nxt == goal:
-                    path = [nxt]
-                    while path[-1] != start:
-                        path.append(parent[path[-1]])
-                    path.reverse()
-                    return path
-                queue.append(nxt)
-        return None
-
-    def _first(self, parent, start, goal):
-        if goal == start or goal not in parent:
-            return start
-        cur = goal
-        while parent[cur] is not None and parent[cur] != start:
-            cur = parent[cur]
-        return cur
-
-    def _dir(self, src, dst):
-        vector = (dst[0] - src[0], dst[1] - src[1])
-        return {
-            (0, 1): Directions.NORTH,
-            (0, -1): Directions.SOUTH,
-            (1, 0): Directions.EAST,
-            (-1, 0): Directions.WEST,
-            (0, 0): Directions.STOP,
-        }.get(vector, Directions.STOP)
-
-    def _nxt(self, pos, action):
-        dx, dy = Actions.direction_to_vector(action)
-        return int(round(pos[0] + dx)), int(round(pos[1] + dy))
-
-    def _md(self, a, b):
-        if a == b:
-            return 0
-        try:
-            return int(self.get_maze_distance(a, b))
-        except Exception:
-            return _manhattan(a, b)
-
-    def _blocked(self, nxt):
-        """Avoid the square we just left when we have been bouncing."""
-        if len(self.hist) < 4:
-            return False
-        if self.hist[-1] == self.hist[-3] and self.hist[-2] == self.hist[-4]:
-            return nxt == self.hist[-2]
-        return False
-
-    def _fallback(self, game_state):
-        legal = game_state.get_legal_actions(self.index)
-        if not legal:
-            return Directions.STOP
-        pos = _ipos(game_state.get_agent_state(self.index).get_position())
-        if pos is None or self.map is None:
+    def _defend(self, game_state, pos, mate, invaders, estimates, legal):
+        me = game_state.get_agent_state(self.index)
+        cost, action = self.maze.routes(pos, legal, {}, home_only=True)
+        doors = [door for door in self.maze.doors if door in cost]
+        if not doors:
             return legal[0]
-        best = legal[0]
-        best_dist = 10 ** 9
+        if int(me.scared_timer) > 0 and invaders:
+            return self._shadow(pos, invaders, estimates, cost, legal)
+        caught = self._retreat_door(game_state, doors)
+        if caught is not None and caught in action:
+            self.held_door, self.held_for = caught, 8
+            return action[caught]
+        sightings = []
+        for index in invaders:
+            for square, weight in estimates.get(index, []):
+                if square in self.maze.home:
+                    sightings.append((index, square, weight))
+        if sightings:
+            return self._intercept(game_state, pos, mate, sightings, cost, action, doors)
+        if self.held_door in doors and self.held_for > 0:
+            self.held_for -= 1
+            return action[self.held_door]
+        target = self._patrol_door(estimates, doors)
+        self.held_door, self.held_for = target, 0
+        return action[target]
+
+    def _shadow(self, pos, invaders, estimates, cost, legal):
+        threats = []
+        for index in invaders:
+            for square, _ in estimates.get(index, []):
+                if square in self.maze.home:
+                    threats.append(square)
+        if not threats:
+            return Directions.STOP if Directions.STOP in legal else legal[0]
+
+        def rank(square):
+            gap = min(self.dist(square, threat) for threat in threats)
+            return (max(0, 3 - gap), abs(gap - 3))
+
+        options = [(pos, Directions.STOP)] + self.maze.edges[pos]
+        options = [(square, action) for square, action in options if action in legal and square in cost]
+        return min(options, key=lambda item: rank(item[0]))[1]
+
+    def _retreat_door(self, game_state, doors):
+        """They stepped off our door. The next move is usually back through it."""
+        previous = self.get_previous_observation()
+        if previous is None:
+            return None
+        for index in self.enemies:
+            if game_state.get_agent_state(index).is_pacman:
+                continue
+            if not previous.get_agent_state(index).is_pacman:
+                continue
+            was = _at(previous.get_agent_position(index))
+            now = _at(game_state.get_agent_position(index))
+            if was in doors and now is not None and self.dist(was, now) <= 2:
+                return was
+        return None
+
+    def _intercept(self, game_state, pos, mate, sightings, cost, action, doors):
+        def rank(item):
+            index, square, weight = item
+            carried = int(game_state.get_agent_state(index).num_carrying)
+            closer = self.dist(mate, square) + 1 < cost.get(square, 99)
+            return (cost.get(square, 99) + (4 if closer else 0) - 3 * min(carried, 4), -weight)
+
+        index, where, _ = min(sightings, key=rank)
+        if cost.get(where, 99) <= 1 and game_state.get_agent_position(index) is not None:
+            self.held_door = where if where in doors else self._door_of(where)
+            self.held_for = 6
+            return action.get(where, Directions.STOP)
+        carried = int(game_state.get_agent_state(index).num_carrying)
+        foods = [_at(bit) for bit in self.get_food_you_are_defending(game_state).as_list()]
+        if carried >= 2 or not foods:
+            goal = min(doors, key=lambda door: self.dist(where, door))
+        else:
+            goal = min(foods, key=lambda bit: self.dist(where, bit))
+        span = self.dist(where, goal)
+        meet = [
+            square for square in cost
+            if cost[square] <= self.dist(where, square)
+            and self.dist(where, square) + self.dist(square, goal) <= span + 1
+        ]
+        target = min(meet, key=lambda square: (self.dist(where, square), cost[square])) if meet else where
+        if target in doors:
+            self.held_door, self.held_for = target, 6
+        return action.get(target, action.get(min(doors, key=cost.get), Directions.STOP))
+
+    def _patrol_door(self, estimates, doors):
+        foods = list(self._defended)
+        best_door = self.watch if self.watch in doors else doors[len(doors) // 2]
+        best_eta = 99
+        for index, particles in estimates.items():
+            if not particles:
+                continue
+            anchor = particles[0][0]
+            if anchor in self.maze.home or not foods:
+                continue
+            food = min(foods, key=lambda bit: self.dist(anchor, bit))
+            door = self._door_of(food)
+            eta = self.dist(anchor, door)
+            if eta < best_eta and door in doors:
+                best_eta = eta
+                best_door = door
+        return best_door
+
+    def _door_of(self, goal):
+        return min(self.maze.doors, key=lambda door: self.dist(goal, door))
+
+    def _opening_door(self, game_state):
+        """Door on the shortest path from their nearest spawn to our nearest food."""
+        foods = [_at(bit) for bit in self.get_food_you_are_defending(game_state).as_list()]
+        spawns = [_at(game_state.get_initial_agent_position(i)) for i in self.enemies]
+        if not foods or not self.maze.doors:
+            return None
+        spawn = min(spawns, key=lambda spot: min(self.dist(spot, bit) for bit in foods))
+        food = min(foods, key=lambda bit: self.dist(spawn, bit))
+        return self._door_of(food)
+
+    def _toward_home(self, game_state, legal):
+        pos = _at(game_state.get_agent_state(self.index).get_position())
+        if pos is None:
+            return legal[0]
+        best, best_dist = legal[0], 99
         for action in legal:
             if action == Directions.STOP:
                 continue
-            nxt = self._nxt(pos, action)
-            dist = self.map.dist_home.get(nxt, 999)
-            if dist < best_dist:
-                best_dist = dist
-                best = action
+            dx, dy = {Directions.NORTH: (0, 1), Directions.SOUTH: (0, -1),
+                      Directions.EAST: (1, 0), Directions.WEST: (-1, 0)}[action]
+            nxt = (pos[0] + dx, pos[1] + dy)
+            if self.maze.bank.get(nxt, 99) < best_dist:
+                best, best_dist = action, self.maze.bank[nxt]
         return best
+
+
+class Raider(_Player):
+    """Brings food home. Starts on offense."""
+
+
+class Guard(_Player):
+    """Holds our doors. Joins the raid only while every enemy ghost is scared."""
+
+    guard = True
