@@ -210,6 +210,9 @@ class CapturePlayer(CaptureAgent):
                       len(self.get_food_you_are_defending(state).as_list())) / 2 - 2
         self.recent = deque(maxlen=12)
         self.goal = None
+        self.goal_hist = deque(maxlen=4)
+        self.taboo = {}
+        self.lock_goal, self.lock = None, 0
         self.bite = None
         self.bite_age = 99
         self.models = {i: OpponentModel(self.maze, state.get_initial_agent_position(i))
@@ -305,7 +308,9 @@ class CapturePlayer(CaptureAgent):
                         continue
                     d = self.dist(g, q)
                     if d < 5:
-                        risk[q] += weight * (30, 19, 5, 1.4, 0.4)[d]
+                        # Twice the original weights: on defaultCapture the
+                        # raider died 3 times a game against a door-holding guard.
+                        risk[q] += weight * (60, 38, 10, 2.8, 0.8)[d]
                 for q in food:
                     mouth = maze.mouth.get(q)
                     if mouth:
@@ -359,9 +364,29 @@ class CapturePlayer(CaptureAgent):
             estimates[i] and state.get_agent_state(i).scared_timer < 7 for i in self.enemies
         )) else 1
 
+        # A two-step cycle means the target keeps flipping, or a guard keeps
+        # turning us back from the same target. Unless we lead, commit to one
+        # target in the first case and steer away from the blocked one in the second.
+        recent = list(self.recent)
+        cycling = (len(recent) >= 6 and recent[-1] == recent[-3] == recent[-5]
+                   and recent[-2] == recent[-4] and recent[-1] != recent[-2])
+        for q in list(self.taboo):
+            self.taboo[q] -= 1
+            if self.taboo[q] <= 0:
+                del self.taboo[q]
+        # A stand-off only helps the side that is ahead, so keep it then.
+        if cycling and self.goal is not None and score <= 0:
+            if len(set(self.goal_hist)) <= 1:
+                self.taboo[self.goal] = 20
+                self.lock = 0
+            else:
+                self.lock_goal, self.lock = self.goal, 8
+
         # Greedy evaluation ranks reachable goals by path cost and weighted features.
         def price(q):
             preference = 0.36 * maze.bank[q] + danger.get(q, 0)
+            if any(self.dist(q, t) <= 3 for t in self.taboo):
+                preference += 12
             if q in capsules:
                 preference -= capsule_bonus
             if mate not in maze.home and self.dist(mate, q) + 1 < self.dist(p, q):
@@ -369,7 +394,13 @@ class CapturePlayer(CaptureAgent):
             if q == self.goal:
                 preference -= 1.5
             return costs[q] + preference
-        self.goal = min(candidates, key=price)
+        if self.lock > 0 and self.lock_goal in candidates:
+            self.lock -= 1
+            self.goal = self.lock_goal
+        else:
+            self.lock = 0
+            self.goal = min(candidates, key=price)
+        self.goal_hist.append(self.goal)
         if me.is_pacman:
             return self.safe_step(p, actions[self.goal], active, capsules, legal)
         return actions[self.goal]
