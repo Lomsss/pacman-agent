@@ -1,9 +1,9 @@
 # Allrounder: what changed and how it was measured
 
-`my_team.py` on this branch is the PR #5 agent plus three changes. On the
+`my_team.py` on this branch is the PR #5 agent plus four changes. On the
 seven opponents that still take points from us on defaultCapture it scores
-about **+0.33 points a game** more (1.99 → 2.40 and 2.10 → 2.35 on two
-independent seed sets). Against the other ten it is unchanged.
+about **+0.5 points a game** more: 1.99 → 2.48 and 2.10 → 2.59 on two
+independent seed sets. Against the other ten it is unchanged.
 
 ## Method
 
@@ -28,6 +28,7 @@ independent seed sets). Against the other ten it is unchanged.
 | Route verification against a chasing ghost | +0.33 / +0.16 |
 | Dead-end trap on our side | +0.10 / +0.19 |
 | Verification and trap together | **+0.41 / +0.24** |
+| Multi-dot trips (on top of the above) | +0.08 / +0.24; full suite +0.06 |
 
 **Colour-symmetric tie-breaks.** Every tie (sorted squares, heap order,
 the first move tried) used raw coordinates. On the 180° symmetric map,
@@ -43,6 +44,15 @@ pessimistically). It takes the best target whose route is not caught.
 Deaths against the BFS team fell from about 2.7 to 1.2 a game in a
 6-game check. Each move uses at most about 2 ms.
 
+**Multi-dot trips.** The raider plans ordered trips of up to 3 dots from
+its 8 best-priced targets, each followed by the best door home. It scores
+a trip by dots banked per move and takes the first step of the best one.
+When a ghost is near, the whole trip must survive the chaser simulation.
+The work is capped by a fixed budget, not a clock, so seeded games replay
+exactly. The slowest move measured was about 0.1 s, and a 0.45 s clock
+guard is a backstop. Against A\* the result went from slightly negative
+to +0.45 / +0.55.
+
 **Dead-end trap.** When a visible invader is in a dead end on our side and
 we can reach its mouth first, the defender holds the mouth instead of
 chasing. A mouth with our capsule below it is skipped.
@@ -55,9 +65,11 @@ chasing. A mouth with our capsule below it is skipped.
 | Sentinel hangs back near our capsule | +0.03, but −0.25 vs A\* (its target) | Lets the A\* attacker through |
 | Double defence to protect a late lead | −0.09 | Gives up points in close games |
 | Runtime opponent identification | not built | See `docs/OPPONENT_ID_DESIGN.md` |
+| Wider verification (all targets, all doors, 10 squares) | −0.04 / +0.09 | More of the same check does not pay |
+| Defender search against the field's attacker pattern | −0.03 / −0.02 alone; −0.41 / −0.39 with trips | Wins against A\* and BFS, but loses mirror matches badly once the raider is away on long trips |
 
-## Open issue
+## Open issues
 
-- A\* is slightly worse on all three seed sets (−0.17, −0.05, −0.40;
-  pooled about −0.17 ± 0.13). It is not significant, but it is the next
-  thing to look at.
+- Not run on the UPF cluster or on Python 3.8. All files parse with the
+  3.8 grammar, use no library feature newer than 3.8, and play cleanly on
+  Python 3.9.6.
