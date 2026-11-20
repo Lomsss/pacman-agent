@@ -17,11 +17,13 @@ STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
 
 
 def create_team(first_index, second_index, is_red, first="Raider", second="Sentinel",
-                num_training=0, prediction="1", **kwargs):
+                num_training=0, prediction="1", lookahead="0", **kwargs):
+    """Default to position tracking. Set prediction=0 or test one-turn replies with lookahead=1."""
     classes = {"Raider": Raider, "Sentinel": Sentinel}
     use_prediction = str(prediction).lower() not in ("0", "false", "off")
-    return [classes.get(first, Raider)(first_index, use_prediction),
-            classes.get(second, Sentinel)(second_index, use_prediction)]
+    use_replies = str(lookahead).lower() in ("1", "true", "on")
+    return [classes.get(first, Raider)(first_index, use_prediction, use_replies),
+            classes.get(second, Sentinel)(second_index, use_prediction, use_replies)]
 
 
 def manhattan(a, b):
@@ -182,9 +184,10 @@ class OpponentModel:
 class CapturePlayer(CaptureAgent):
     guarding = False
 
-    def __init__(self, index, prediction=True):
+    def __init__(self, index, prediction=True, lookahead=False):
         super().__init__(index)
         self.prediction = prediction
+        self.lookahead = lookahead
 
     def register_initial_state(self, state):
         # Replace the base class's eager Dijkstra distancer with unit-edge BFS.
@@ -223,6 +226,8 @@ class CapturePlayer(CaptureAgent):
             enemy = state.get_agent_state(i)
             sources, direction = self.models[i].update(state, i, p, mate, missing)
             estimates[i] = sources
+            if not self.lookahead:
+                continue
             if enemy.is_pacman:
                 goals = (self.maze.doors if enemy.num_carrying >= 2 else
                          sorted(self.defended) or self.maze.doors)
