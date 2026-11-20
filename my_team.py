@@ -426,6 +426,16 @@ class CapturePlayer(CaptureAgent):
                          self.dist(inv, q) + self.dist(q, goal) == length]
             target = min(reachable, key=lambda q: (self.dist(inv, q), costs[q])) if reachable else inv
             return actions[target]
+        # An invader can dip back over the line and re-enter next turn.
+        # Finish covering that door while it is still one step away.
+        previous = self.get_previous_observation()
+        if previous and not invaders and not me.scared_timer:
+            for i in self.enemies:
+                door = previous.get_agent_position(i)
+                enemy = state.get_agent_position(i)
+                if (door in doors and previous.get_agent_state(i).is_pacman
+                        and enemy is not None and self.dist(door, enemy) == 1):
+                    return actions[door]
         if invaders and self.bite_age <= 6 and self.bite in costs:
             return actions[self.bite]
         # Patrol crossings close to protected resources. Shift toward an
