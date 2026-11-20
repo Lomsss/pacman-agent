@@ -35,6 +35,9 @@ _HORIZON = 160
 _SHARE = {"sonar": {}, "cover": {}, "hunt": {}}
 # Scared longer than this, a ghost raids instead of shadowing the invader.
 _SCARED_RAID = 12
+# Seconds the attacker may spend searching a close fight. The limit is 1 s.
+_SEARCH_TIME = float(os.environ.get("SEARCH_TIME", "0.25"))
+_SEARCH_RANGE = int(os.environ.get("SEARCH_RANGE", "6"))
 
 
 def create_team(first_index, second_index, is_red,
@@ -282,6 +285,10 @@ class ContestAgent(CaptureAgent):
             and self.map.on_home(stepped)
         ):
             action = self._cross(game_state, me, reports)
+        if mode in ("attack", "raid") and _SEARCH_TIME > 0:
+            searched = self._tactics(game_state, me, reports, action)
+            if searched is not None:
+                action = searched
         self.hist.append(me["pos"])
         if len(self.hist) > 12:
             self.hist.pop(0)
@@ -822,6 +829,155 @@ class ContestAgent(CaptureAgent):
         if self._blocked(nxt):
             return self._commit(game_state, me, ghosts, foods)
         return action
+
+    # ------------------------------------------------------------ tactics
+
+    def _tactics(self, game_state, me, reports, planned):
+        """Alpha-beta look-ahead when a ghost we can see is close.
+
+        The model holds our square, the visible ghosts, the dots we eat on
+        the way, what we carry and what we bank. Ghosts move after us and
+        stay on their side. Depth grows one round at a time until the time
+        budget is spent, so a quiet position costs nothing and a fight gets
+        as deep as the clock allows.
+        """
+        import time
+        pos = me["pos"]
+        ghosts = []
+        for report in reports:
+            if report["is_pacman"] or report["visible"] is None:
+                continue
+            if report["scared"] > 2:
+                continue
+            if self._md(pos, report["visible"]) <= _SEARCH_RANGE:
+                ghosts.append(report["visible"])
+        if not ghosts:
+            return None
+        if self.map.on_home(pos) and me["carrying"] == 0:
+            # Only worth it at the door: about to cross with a guard nearby.
+            if self.map.dist_home.get(pos, 0) == 0 and pos not in self.map.border_set:
+                return None
+        self._tac_food = set(self._foods(game_state))
+        self._tac_caps = set(_ipos(cap) for cap in self.get_capsules(game_state))
+        self._tac_deadline = time.perf_counter() + _SEARCH_TIME
+        self._tac_planned = self._nxt(pos, planned)
+        start = (pos, tuple(ghosts), frozenset(), me["carrying"], 0)
+        legal = game_state.get_legal_actions(self.index)
+        moves = [(action, self._nxt(pos, action)) for action in legal]
+        ordered = sorted(moves, key=lambda item: 0 if item[1] == self._tac_planned else 1)
+        done = None
+        depth = 1
+        while depth <= 12:
+            scores = {}
+            alpha = -1e9
+            try:
+                for action, nxt in ordered:
+                    value = self._tac_after_me(self._tac_step(start, nxt), depth, alpha, 1e9)
+                    if action == Directions.STOP:
+                        value -= 0.5
+                    scores[action] = value
+                    alpha = max(alpha, value)
+            except TimeoutError:
+                break
+            done = scores
+            if max(scores.values()) <= -900:
+                break
+            depth += 1
+        # Keep the strategic plan unless the search proves it walks into a
+        # catch that another move avoids. The plan is searched first, so its
+        # value is exact; the others are bounds, but the best one is exact.
+        if not done or planned not in done:
+            return None
+        best_action = max(done, key=done.get)
+        if done[planned] > -900 or done[best_action] <= -900:
+            return planned
+        return best_action
+
+    def _tac_step(self, state, nxt):
+        me, ghosts, eaten, carry, banked = state
+        if nxt in ghosts:
+            return None
+        if nxt in self._tac_food and nxt not in eaten:
+            eaten = eaten | {nxt}
+            carry += 1
+        if nxt in self._tac_caps and nxt not in eaten:
+            eaten = eaten | {nxt}
+            return (nxt, (), eaten, carry, banked + 0.5)
+        if self.map.on_home(nxt) and carry:
+            banked += carry
+            carry = 0
+        return (nxt, ghosts, eaten, carry, banked)
+
+    def _tac_after_me(self, state, depth, alpha, beta):
+        """Ghosts' turn: each ghost picks its move, minimising our value."""
+        import time
+        if state is None:
+            return -1000
+        if time.perf_counter() > self._tac_deadline:
+            raise TimeoutError
+        me, ghosts, eaten, carry, banked = state
+        if not ghosts or self.map.on_home(me):
+            return self._tac_value(state, depth)
+        options = []
+        for ghost in ghosts:
+            moves = [cell for cell in self.map.neighbors[ghost] if not self.map.on_home(cell)] + [ghost]
+            moves.sort(key=lambda cell: _manhattan(cell, me))
+            options.append(moves[:4])
+        combos = [()]
+        for moves in options:
+            combos = [combo + (cell,) for combo in combos for cell in moves]
+        value = 1e9
+        for combo in combos:
+            if me in combo:
+                result = -1000 - 5 * carry
+            else:
+                result = self._tac_me((me, combo, eaten, carry, banked), depth - 1, alpha, beta)
+            if result < value:
+                value = result
+            if value <= alpha:
+                return value
+            if value < beta:
+                beta = value
+        return value
+
+    def _tac_me(self, state, depth, alpha, beta):
+        if depth <= 0:
+            return self._tac_value(state, depth)
+        me = state[0]
+        value = -1e9
+        for nxt in self.map.neighbors[me] + [me]:
+            result = self._tac_after_me(self._tac_step(state, nxt), depth, alpha, beta)
+            if result > value:
+                value = result
+            if value >= beta:
+                return value
+            if value > alpha:
+                alpha = value
+        return value
+
+    def _tac_value(self, state, depth):
+        me, ghosts, eaten, carry, banked = state
+        value = 12.0 * banked + 3.0 * carry
+        # Sooner is better: rounds left unused add a little.
+        value += 0.05 * max(depth, 0)
+        home = self.map.dist_home.get(me, 0)
+        value -= 0.25 * carry * home
+        left = [food for food in self._tac_food if food not in eaten]
+        if left and carry < 6:
+            value -= 0.4 * min(_manhattan(me, food) for food in left)
+        if not self.map.on_home(me):
+            for ghost in ghosts:
+                gap = self._md(me, ghost)
+                if gap <= 1:
+                    value -= 400
+                elif gap == 2:
+                    value -= 30
+                elif gap <= 4:
+                    value -= 6.0 / gap
+                # A corridor deeper than the ghost's lead is a trap.
+                if self.map.tunnel.get(me, 0) * 2 >= gap:
+                    value -= 15
+        return value
 
     def _commit(self, game_state, me, ghosts, foods):
         """Take food when the safe plan has nothing. Only refuse a square a ghost can step onto."""
