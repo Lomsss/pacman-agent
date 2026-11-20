@@ -1,5 +1,11 @@
 # How our agents play
 
+> **Previous agent.** This report describes the `ContestAgent` team that
+> was in `my_team.py` up to commit `1aef08f`. That file now holds the
+> crowded-stalls team (`Raider` and `Sentinel`), which beat this one 59
+> games to 0 on defaultCapture. Read the old code with
+> `git show 1aef08f:my_team.py`.
+
 This report explains every technique in `my_team.py` and how the
 techniques work together. The section numbers (§1 to §11) match the
 `§` banners in the source, so you can jump from a heading here to the

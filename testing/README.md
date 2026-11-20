@@ -33,9 +33,35 @@ difference under about 0.1 points per game as noise.
 | `approxq` | a linear Q-function over hand-tuned features (what approximate Q-learning produces), plus a defender |
 | `minimax` | an alpha-beta attacker against the ghosts it can see, plus a defender |
 | `mcts` | a Monte Carlo tree search attacker (UCT with rollouts), plus a defender |
+| `astar` | an A* attacker that plans whole paths around the ghosts it can see, plus a defender |
+| `camper` | a greedy attacker plus a defender that camps on the border level with the nearest enemy |
 | `mirror_attack` | our own code with both agents attacking |
 | `git:<ref>` | any past version of `my_team.py` |
 
 All opponents only use what the game gives every agent (their own
 observation, maze distances and noisy sonar), so results reflect what a
 real opponent could do.
+
+## The contest map
+
+The tournament is played on `defaultCapture` only, so test there first.
+Repeating a layout in `-f` plays it again with fresh random sonar:
+
+```bash
+D=$(python3 -c "print(','.join(['defaultCapture'] * 20))")
+python testing/bench.py -f "$D" -r 0 -o astar,capsule,git:main   # 40 games per opponent
+```
+
+Treat the other maps as a robustness check. On one map, a difference needs
+roughly 40 games per opponent before it stands out from the noise.
+
+## Why a game was won or lost (`match_stats.py`)
+
+`match_stats.py` replays every game's moves and counts what happened inside
+it, per team: dots banked, deaths as pacman, dots lost by dying, scared
+ghosts eaten, capsules eaten, moves on the enemy side, the largest load,
+who scored first, lead changes and the score after each quarter.
+
+```bash
+python testing/match_stats.py -a my_team.py -b testing/opponents/astar_team.py -f "$D" -r 0
+```

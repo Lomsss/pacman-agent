@@ -9,4 +9,6 @@ _spec.loader.exec_module(_mod)
 
 
 def create_team(first_index, second_index, is_red, **kw):
-    return [_mod.ContestAgent(first_index, role="offense"), _mod.ContestAgent(second_index, role="offense")]
+    if hasattr(_mod, "ContestAgent"):  # the earlier agent, with roles
+        return [_mod.ContestAgent(first_index, role="offense"), _mod.ContestAgent(second_index, role="offense")]
+    return _mod.create_team(first_index, second_index, is_red, first="Raider", second="Raider")

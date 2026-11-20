@@ -34,6 +34,8 @@ OPPONENTS = {
     "approxq": "approxq_team",          # linear Q-function features
     "minimax": "minimax_team",          # alpha-beta attacker
     "mcts": "mcts_team",                # Monte Carlo tree search attacker
+    "astar": "astar_team",              # A* path planner around visible ghosts
+    "camper": "camper_team",            # greedy attacker plus a border-mirroring camper
     "mirror_attack": "mirror_attack_team",  # our own code, both on offense
 }
 FIXED = ["defaultCapture", "alleyCapture", "bloxCapture", "crowdedCapture", "distantCapture",
