@@ -35,6 +35,9 @@ difference under about 0.1 points per game as noise.
 | `mcts` | a Monte Carlo tree search attacker (UCT with rollouts), plus a defender |
 | `astar` | an A* attacker that plans whole paths around the ghosts it can see, plus a defender |
 | `camper` | a greedy attacker plus a defender that camps on the border level with the nearest enemy |
+| `mdp` | value iteration over a reward grid (food, capsules, home when loaded, ghost penalties), both roles |
+| `bfs` | plain BFS: nearest dot with squares next to a ghost treated as walls, and a chasing defender |
+| `abfull` | full-state alpha-beta with iterative deepening over `generate_successor`, 0.25 s per move |
 | `mirror_attack` | our own code with both agents attacking |
 | `git:<ref>` | any past version of `my_team.py` |
 
@@ -54,6 +57,31 @@ python testing/bench.py -f "$D" -r 0 -o astar,capsule,git:main   # 40 games per 
 
 Treat the other maps as a robustness check. On one map, a difference needs
 roughly 40 games per opponent before it stands out from the noise.
+
+## Comparing two versions (`--game-seed`, `paired.py`)
+
+`--game-seed` seeds every game (which team moves first, the sonar noise),
+so two agents can play exactly the same games. Against deterministic
+opponents a seeded game replays move for move. `paired.py` then compares
+the runs game by game; only games whose result changed carry information,
+so effects of about 0.1 points per game show up in a few hundred games.
+
+```bash
+D=$(python3 -c "print(','.join(['defaultCapture'] * 20))")
+OPP=astar,bfs,mdp,switcher,git:main,git:origin/codex/crowded-stalls,git:origin/Cursor
+python testing/bench.py -a my_team.py   -o $OPP -f "$D" -r 0 --game-seed s1 --json ref.json
+python testing/bench.py -a candidate.py -o $OPP -f "$D" -r 0 --game-seed s1 --json new.json
+python testing/paired.py ref.json new.json
+```
+
+These seven opponents are the "hard suite": the ones that do not lose every
+game on defaultCapture, so they separate two versions. Confirm a gain on a
+second seed (`s2`) before keeping it, and run the full opponent list once to
+check nothing else got worse. Opponents that stop searching on a clock
+(`abfull`, `minimax`, `mcts`) do not replay exactly.
+
+The contest framework needs `frozendict`; if your Python lacks it, run
+`pip install frozendict==2.3.4`.
 
 ## Why a game was won or lost (`match_stats.py`)
 

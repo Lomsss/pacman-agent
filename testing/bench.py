@@ -36,6 +36,9 @@ OPPONENTS = {
     "mcts": "mcts_team",                # Monte Carlo tree search attacker
     "astar": "astar_team",              # A* path planner around visible ghosts
     "camper": "camper_team",            # greedy attacker plus a border-mirroring camper
+    "mdp": "mdp_team",                  # value iteration over a reward grid, both roles
+    "bfs": "bfs_team",                  # plain BFS, squares next to ghosts treated as walls
+    "abfull": "abfull_team",            # full-state alpha-beta with iterative deepening
     "mirror_attack": "mirror_attack_team",  # our own code, both on offense
 }
 FIXED = ["defaultCapture", "alleyCapture", "bloxCapture", "crowdedCapture", "distantCapture",
@@ -57,11 +60,13 @@ def resolve(name, tmp):
     return os.path.abspath(name)
 
 
-def play(agent, opp, layout, side, length):
+def play(agent, opp, layout, side, length, seed=None):
     red, blue = (agent, opp) if side == "red" else (opp, agent)
     env = dict(os.environ, PYTHONPATH=CONTEST_SRC + os.pathsep + OPP_DIR + os.pathsep + os.environ.get("PYTHONPATH", ""))
     cmd = [sys.executable, "capture.py", "-r", red, "-b", blue, "-l", layout, "-Q", "-c",
            "--delay-step", "0", "-i", str(length)]
+    if seed is not None:
+        cmd += ["--setRandomSeed", seed]
     try:
         out = subprocess.run(cmd, cwd=CONTEST, env=env, capture_output=True, text=True, timeout=1800)
     except subprocess.TimeoutExpired:
@@ -101,6 +106,7 @@ def main():
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
     ap.add_argument("-i", "--length", type=int, default=1200)
     ap.add_argument("--json")
+    ap.add_argument("--game-seed", help="seed every game (who starts, sonar noise) so two agents can be compared on the same games")
     args = ap.parse_args()
 
     layouts = [l for l in args.fixed.split(",") if l] + [f"RANDOM{args.seed + k}" for k in range(args.random)]
@@ -108,12 +114,13 @@ def main():
     tmp = tempfile.mkdtemp(prefix="bench_")
     opps = [o for o in args.opponents.split(",") if o]
     paths = {o: resolve(o, tmp) for o in opps}
-    jobs = [(o, l, side) for o in opps for l in layouts for side in ("red", "blue")]
+    jobs = [(o, l, side, k) for o in opps for k, l in enumerate(layouts) for side in ("red", "blue")]
     print(f"{len(jobs)} games: {len(opps)} opponents x {len(layouts)} maps x 2 colours, {args.jobs} at a time", flush=True)
 
     def run(job):
-        o, l, side = job
-        return dict(play(agent, paths[o], l, side, args.length), opponent=o, layout=l, side=side)
+        o, l, side, k = job
+        seed = None if args.game_seed is None else f"{args.game_seed}:{o}:{l}:{k}:{side}"
+        return dict(play(agent, paths[o], l, side, args.length, seed), opponent=o, layout=l, side=side, seed=seed)
 
     with ThreadPoolExecutor(args.jobs) as ex:
         results = list(ex.map(run, jobs))
