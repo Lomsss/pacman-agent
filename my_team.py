@@ -25,10 +25,6 @@ from contest.util import nearest_point
 _INF = 10 ** 9
 _STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
           (0, 1, Directions.NORTH), (0, -1, Directions.SOUTH))
-# Teammates share one process. The lower index clears this each game.
-_SHARE = {"sonar": {}, "token": None}
-
-
 def create_team(first_index, second_index, is_red,
                 first="Raider", second="Guard", num_training=0, **kwargs):
     """Tournament entry. No extra options are passed in."""
@@ -230,12 +226,6 @@ class _Player(CaptureAgent):
         self.held_door = None
         self.held_for = 0
         self._defended = set(map(_at, self.get_food_you_are_defending(game_state).as_list()))
-        walls = game_state.get_walls()
-        token = (self.red, walls.width, walls.height, len(self.maze.cells), self.quota)
-        if self.index == min(self.get_team(game_state)) or _SHARE["token"] != token:
-            _SHARE["token"] = token
-            _SHARE["sonar"] = {}
-
     def choose_action(self, game_state):
         legal = game_state.get_legal_actions(self.index)
         try:
@@ -263,7 +253,13 @@ class _Player(CaptureAgent):
         # A second attacker is safe only while nobody is near our doors.
         # The moment an invader exists, the guard is already on the way home.
         border_clear = not invaders and not self._border_threat(estimates)
-        assist = self.guard and moves > 45 and not emergency and (feast or border_clear)
+        # Keep pressing with two attackers until the lead is worth protecting.
+        # Unknown teams commonly answer a small lead with two attackers; a
+        # five-point cushion is large enough for one guard to preserve.
+        assist = (
+            self.guard and moves > 45 and not emergency
+            and (feast or (border_clear and score < 5))
+        )
         visible_near = (not me.is_pacman) and any(
             self.dist(pos, _at(game_state.get_agent_position(i))) <= 2
             for i in invaders if game_state.get_agent_position(i) is not None
@@ -279,7 +275,6 @@ class _Player(CaptureAgent):
         passed = max(0, self.last_time - now)
         self.last_time = now
         distances = game_state.get_agent_distances() or []
-        noisy = {}
         estimates = {}
         for index in self.enemies:
             moved = Counter()
@@ -289,39 +284,9 @@ class _Player(CaptureAgent):
                 moved[cursor] += 1
             moves = moved[index]
             reading = int(distances[index]) if distances else None
-            noisy[index] = reading
             self.tracks[index].update(game_state, index, pos, mate, moves, reading, missing)
             estimates[index] = self.tracks[index].top()
-        _SHARE["sonar"][self.index] = {"at": now, "pos": pos, "noisy": noisy}
-        self._fuse(now, estimates)
         return estimates
-
-    def _fuse(self, now, estimates):
-        """Drop particles the teammate's sonar already rules out."""
-        pack = None
-        mate_index = None
-        for key, value in _SHARE["sonar"].items():
-            if key != self.index:
-                pack, mate_index = value, key
-        if not pack or now - pack["at"] <= 0 or now - pack["at"] > 3:
-            return
-        moved = set()
-        cursor = mate_index
-        while cursor != self.index:
-            moved.add(cursor)
-            cursor = (cursor + 1) % 4
-        for index, particles in list(estimates.items()):
-            reading = pack["noisy"].get(index)
-            if reading is None:
-                continue
-            tol = 7 if index in moved else 6
-            mx, my = pack["pos"]
-            kept = [
-                (pos, mass) for pos, mass in particles
-                if abs(abs(pos[0] - mx) + abs(pos[1] - my) - reading) <= tol
-            ]
-            if kept:
-                estimates[index] = kept
 
     def _missing(self, game_state):
         current = set(map(_at, self.get_food_you_are_defending(game_state).as_list()))
@@ -380,7 +345,10 @@ class _Player(CaptureAgent):
         bonus = 6 if (len(food) <= 6 or self._blocked_border(estimates, game_state)) else 2
 
         def price(goal):
-            value = cost[goal] + 0.8 * self.maze.bank.get(goal, 8) + danger.get(goal, 0)
+            # Red moves before blue in each round and can safely take slightly
+            # deeper food. Blue values short return trips more heavily.
+            home_weight = 0.35 if self.red else 0.8
+            value = cost[goal] + home_weight * self.maze.bank.get(goal, 8) + danger.get(goal, 0)
             if goal in capsules:
                 value -= bonus
             elif goal not in food:
