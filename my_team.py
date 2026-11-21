@@ -3,7 +3,6 @@
 # purposes. The Pacman AI projects were developed at UC Berkeley, primarily by
 # John DeNero and Dan Klein. See http://ai.berkeley.edu.
 """UPF capture pair. All live inputs come from this agent's observation."""
-import time
 from collections import Counter, deque
 from heapq import heappop, heappush
 
@@ -15,17 +14,6 @@ from contest.util import nearest_point
 INF = float("inf")
 STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
          (0, 1, Directions.NORTH), (0, -1, Directions.SOUTH))
-# Blue sees the map rotated by 180 degrees, so its first step to try is the
-# mirror image of red's. Every tie then breaks the same way for both colours.
-BLUE_STEPS = ((-1, 0, Directions.WEST), (1, 0, Directions.EAST),
-              (0, -1, Directions.SOUTH), (0, 1, Directions.NORTH))
-# Trip planning is capped by work, never by the clock, so seeded games replay
-# exactly: targets drawn, stops per trip, exits tried, trips scored, ghost squares moved.
-TRIP_POOL, TRIP_DEPTH, TRIP_DOORS = 8, 3, 3
-TRIP_EVALS, TRIP_STEPS = 600, 60000
-# The raider rarely banks right after a trip, so the return leg weighs what
-# the single-target price gives it; a one-stop trip then ranks as that price.
-TRIP_HOME = 0.36
 
 
 def create_team(first_index, second_index, is_red, first="Raider", second="Sentinel",
@@ -45,14 +33,10 @@ def manhattan(a, b):
 class Maze:
     def __init__(self, walls, red):
         cells = set(walls.as_list(False))
-        # Tie-breaks follow each team's own view of the map: blue's key is
-        # red's after a 180-degree rotation, so both colours play the same game.
-        self.key = {p: p if red else (walls.width - 1 - p[0], walls.height - 1 - p[1]) for p in cells}
-        steps = STEPS if red else BLUE_STEPS
-        self.edges = {p: [((p[0] + dx, p[1] + dy), action) for dx, dy, action in steps
-                          if (p[0] + dx, p[1] + dy) in cells] for p in self.order(cells)}
+        self.edges = {p: [((p[0] + dx, p[1] + dy), action) for dx, dy, action in STEPS
+                          if (p[0] + dx, p[1] + dy) in cells] for p in sorted(cells)}
         self.home = {p for p in cells if (p[0] < walls.width // 2) == red}
-        self.doors = self.order(p for p in self.home if any(q not in self.home for q, _ in self.edges[p]))
+        self.doors = sorted(p for p in self.home if any(q not in self.home for q, _ in self.edges[p]))
         # Breadth-first search (BFS) gives shortest path lengths on unit-cost edges.
         # Repeat from each source and cache its distance row for move decisions.
         # On oversized boards keep only crossing rows and use Manhattan elsewhere.
@@ -72,14 +56,8 @@ class Maze:
         # Graph pruning by degree identifies dead ends and their escape mouths.
         # Peel leaves on the enemy side. A raider below a peeled cell must
         # revisit its mouth before it can bank, even in a branching cul-de-sac.
-        self.mouth = self.peel(lambda p: p not in self.home)
-        # Our own pockets trap invaders the same way: whoever holds the mouth
-        # first keeps an invader below it from getting home.
-        self.home_mouth = {p: m for p, m in self.peel(lambda p: p in self.home).items() if m in self.home}
-
-    def peel(self, side):
         degree = {p: len(edges) for p, edges in self.edges.items()}
-        leaves = deque(p for p in self.edges if side(p) and degree[p] == 1)
+        leaves = deque(p for p in self.edges if p not in self.home and degree[p] == 1)
         parents = []
         while leaves:
             p = leaves.popleft()
@@ -87,17 +65,13 @@ class Maze:
                 if degree[q] > 0:
                     parents.append((p, q))
                     degree[q] -= 1
-                    if degree[q] == 1 and side(q):
+                    if degree[q] == 1 and q not in self.home:
                         leaves.append(q)
                     break
             degree[p] = 0
-        mouth = {}
+        self.mouth = {}
         for p, q in reversed(parents):
-            mouth[p] = mouth.get(q, q)
-        return mouth
-
-    def order(self, squares):
-        return sorted(squares, key=self.key.__getitem__)
+            self.mouth[p] = self.mouth.get(q, q)
 
     def dist(self, p, q):
         if p in self.rows:
@@ -108,16 +82,15 @@ class Maze:
 
     # Uniform-cost search (Dijkstra) expands the lowest cumulative cost first.
     # The expansion cap bounds work, and first actions are shared across goals.
-    def routes(self, origin, legal, risk, home_only=False, parent=None):
+    def routes(self, origin, legal, risk, home_only=False):
         """Multi-goal UCS. Path cost is moves plus nonnegative danger in move units.
-        First actions let us price all food and all exits with one search.
-        A parent dict, if given, records each square's predecessor."""
+        First actions let us price all food and all exits with one search."""
         cost = {origin: 0}
         action = {origin: Directions.STOP}
-        queue = [(0, self.key[origin], origin)]
+        queue = [(0, origin)]
         expanded = 0
         while queue and expanded < 850:
-            g, _, p = heappop(queue)
+            g, p = heappop(queue)
             if g != cost[p]:
                 continue
             expanded += 1
@@ -128,58 +101,8 @@ class Maze:
                 if new < cost.get(q, INF):
                     cost[q] = new
                     action[q] = step if p == origin else action[p]
-                    if parent is not None:
-                        parent[q] = p
-                    heappush(queue, (new, self.key[q], q))
+                    heappush(queue, (new, q))
         return cost, action
-
-    @staticmethod
-    def trace(parent, q):
-        # Walk predecessors back to the search origin, which has none.
-        path = [q]
-        while path[-1] in parent:
-            path.append(parent[path[-1]])
-        return path[::-1]
-
-    def descent(self, q, goal):
-        # Shortest path by distance rows; the first closer edge keeps ties canonical.
-        path = [q]
-        while path[-1] != goal:
-            here = self.dist(path[-1], goal)
-            step = next((n for n, _ in self.edges[path[-1]] if self.dist(n, goal) == here - 1), None)
-            if step is None or len(path) > 200:
-                return None
-            path.append(step)
-        return path
-
-    def chase(self, squares, target):
-        """Squares a chasing ghost may occupy after one move: from each possible
-        square, every stay-or-step on its own side that closes on target most."""
-        reach = set()
-        for g in squares:
-            options = [g] + [n for n, _ in self.edges[g] if n not in self.home]
-            best = min(self.dist(n, target) for n in options)
-            reach.update(n for n in options if self.dist(n, target) == best)
-        if len(reach) > 12:
-            # Keep the set small; the closest squares are the ones that catch us.
-            reach = set(sorted(reach, key=lambda n: (self.dist(n, target), self.key[n]))[:12])
-        return reach
-
-    def survive(self, path, ghosts, t, capsules, bank):
-        """Walk path[1:] against chasing ghosts given as (squares, scared_timer).
-        Returns (verdict, ghosts, t): True once a capsule (or home, if bank) is
-        reached, False if caught, None if the path ends with us still exposed."""
-        for q in path[1:]:
-            t += 1
-            if q in capsules or (bank and q in self.home):
-                return True, ghosts, t
-            # A ghost still scared at this time cannot catch us.
-            if any(q in squares for squares, scared in ghosts if scared <= t):
-                return False, ghosts, t
-            ghosts = [(self.chase(squares, q), scared) for squares, scared in ghosts]
-            if any(q in squares for squares, scared in ghosts if scared <= t):
-                return False, ghosts, t
-        return None, ghosts, t
 
 
 class OpponentModel:
@@ -287,9 +210,6 @@ class CapturePlayer(CaptureAgent):
                       len(self.get_food_you_are_defending(state).as_list())) / 2 - 2
         self.recent = deque(maxlen=12)
         self.goal = None
-        self.goal_hist = deque(maxlen=4)
-        self.taboo = {}
-        self.lock_goal, self.lock = None, 0
         self.bite = None
         self.bite_age = 99
         self.models = {i: OpponentModel(self.maze, state.get_initial_agent_position(i))
@@ -318,7 +238,7 @@ class CapturePlayer(CaptureAgent):
                 continue
             if enemy.is_pacman:
                 goals = (self.maze.doors if enemy.num_carrying >= 2 else
-                         self.maze.order(self.defended) or self.maze.doors)
+                         sorted(self.defended) or self.maze.doors)
             else:
                 goals = [q for q in (p, mate) if q not in self.maze.home] or self.maze.doors
             self.forecast[i] = self.models[i].replies(sources, direction, goals,
@@ -326,7 +246,6 @@ class CapturePlayer(CaptureAgent):
         return estimates
 
     def choose_action(self, state):
-        self.started = time.perf_counter()
         legal = state.get_legal_actions(self.index)
         # CaptureAgent.get_action already continues straight at fractional positions.
         if len(legal) == 1:
@@ -340,7 +259,7 @@ class CapturePlayer(CaptureAgent):
         self.defended = defended
         self.bite_age += 1
         if missing:
-            self.bite = min(self.maze.order(missing), key=lambda q: self.dist(p, q))
+            self.bite = min(missing, key=lambda q: self.dist(p, q))
             self.bite_age = 0
         estimates = self.observe(state, p, mate, missing)
         invaders = [i for i in self.enemies if state.get_agent_state(i).is_pacman]
@@ -370,7 +289,7 @@ class CapturePlayer(CaptureAgent):
         maze = self.maze
         me = state.get_agent_state(self.index)
         carried = me.num_carrying
-        food = maze.order(self.get_food(state).as_list())
+        food = self.get_food(state).as_list()
         capsules = set(self.get_capsules(state))
         # A visible defender contests adjacent squares on its next turn.
         # A capsule is consumed before collision testing, so it is a safe step.
@@ -386,9 +305,7 @@ class CapturePlayer(CaptureAgent):
                         continue
                     d = self.dist(g, q)
                     if d < 5:
-                        # Twice the original weights: on defaultCapture the
-                        # raider died 3 times a game against a door-holding guard.
-                        risk[q] += weight * (60, 38, 10, 2.8, 0.8)[d]
+                        risk[q] += weight * (30, 19, 5, 1.4, 0.4)[d]
                 for q in food:
                     mouth = maze.mouth.get(q)
                     if mouth:
@@ -402,8 +319,7 @@ class CapturePlayer(CaptureAgent):
                     risk[q] += 18 * probability
         for q, count in Counter(self.recent).items():
             risk[q] += 0.65 * max(0, count - 1)
-        parent = {}
-        costs, actions = maze.routes(p, legal, risk, parent=parent)
+        costs, actions = maze.routes(p, legal, risk)
         doors = [q for q in maze.doors if q in costs]
         if not doors:
             return legal[0]
@@ -436,192 +352,27 @@ class CapturePlayer(CaptureAgent):
         if me.is_pacman and (cash or recall or not food):
             self.goal = bank
             return self.safe_step(p, actions[bank], active, capsules, legal)
-        candidates = [q for q in food + maze.order(capsules) if q in costs]
+        candidates = [q for q in food + sorted(capsules) if q in costs]
         if not candidates:
             return actions[bank]
         capsule_bonus = 4 if (len(food) < 5 or any(
             estimates[i] and state.get_agent_state(i).scared_timer < 7 for i in self.enemies
         )) else 1
 
-        # A two-step cycle means the target keeps flipping, or a guard keeps
-        # turning us back from the same target. Unless we lead, commit to one
-        # target in the first case and steer away from the blocked one in the second.
-        recent = list(self.recent)
-        cycling = (len(recent) >= 6 and recent[-1] == recent[-3] == recent[-5]
-                   and recent[-2] == recent[-4] and recent[-1] != recent[-2])
-        for q in list(self.taboo):
-            self.taboo[q] -= 1
-            if self.taboo[q] <= 0:
-                del self.taboo[q]
-        # A stand-off only helps the side that is ahead, so keep it then.
-        if cycling and self.goal is not None and score <= 0:
-            if len(set(self.goal_hist)) <= 1:
-                self.taboo[self.goal] = 20
-                self.lock = 0
-            else:
-                self.lock_goal, self.lock = self.goal, 8
-
         # Greedy evaluation ranks reachable goals by path cost and weighted features.
-        def extra(q):
-            # Per-target terms a trip pays at every stop; the home-distance
-            # term stays out because a trip prices its own return leg.
-            preference = danger.get(q, 0)
-            if any(self.dist(q, t) <= 3 for t in self.taboo):
-                preference += 12
+        def price(q):
+            preference = 0.36 * maze.bank[q] + danger.get(q, 0)
             if q in capsules:
                 preference -= capsule_bonus
             if mate not in maze.home and self.dist(mate, q) + 1 < self.dist(p, q):
                 preference += 4
-            return preference
-
-        def price(q):
-            return costs[q] + 0.36 * maze.bank[q] + extra(q) - 1.5 * (q == self.goal)
-        if self.lock > 0 and self.lock_goal in candidates:
-            self.lock -= 1
-            self.goal = self.lock_goal
-        else:
-            self.lock = 0
-            choice = min(candidates, key=price)
-            ghosts = [(nearest_point(state.get_agent_position(i)), state.get_agent_state(i).scared_timer)
-                      for i in self.enemies if state.get_agent_position(i) is not None
-                      and not state.get_agent_state(i).is_pacman]
-            # A ghost whose fright ends within the risk horizon is already a threat.
-            threat = any(scared <= 5 and self.dist(p, g) <= 10 for g, scared in ghosts)
-            if me.is_pacman or maze.bank[p] <= 1:
-                # Hidden defenders enter the replay at their likeliest squares,
-                # and only to vet a trip that carries more than the limit.
-                hidden = [(set(q for q, _ in estimates[i]), state.get_agent_state(i).scared_timer)
-                          for i in self.enemies if state.get_agent_position(i) is None
-                          and not state.get_agent_state(i).is_pacman]
-                trip = self.trips(p, sorted(candidates, key=price), costs, parent, extra, capsules,
-                                  ghosts, hidden, carried, limit, threat)
-                if trip is not None:
-                    choice = trip
-                # Otherwise today's choice: with a chasing ghost nearby, replay
-                # single targets and prefer the cheapest we can bring home.
-                elif any(scared == 0 and self.dist(p, g) <= 7 for g, scared in ghosts):
-                    choice = self.verified(candidates, price, parent, costs, doors, capsules,
-                                           [({g}, scared) for g, scared in ghosts], carried, choice)
-            self.goal = choice
-        self.goal_hist.append(self.goal)
+            if q == self.goal:
+                preference -= 1.5
+            return costs[q] + preference
+        self.goal = min(candidates, key=price)
         if me.is_pacman:
             return self.safe_step(p, actions[self.goal], active, capsules, legal)
         return actions[self.goal]
-
-    def trips(self, p, ranked, costs, parent, extra, capsules, ghosts, hidden, carried, limit, threatened):
-        """Best first stop of a short multi-dot trip, or None. A trip visits up
-        to TRIP_DEPTH of the best-priced targets in order, then banks; it scores
-        stops per move. Work is counted, not timed, so games replay exactly."""
-        maze = self.maze
-        pool = ranked[:TRIP_POOL]
-        seen = [({g}, scared) for g, scared in ghosts]
-        every = seen + [h for h in hidden if h[0]]
-        # Without a belief for some defender a long trip cannot be vetted.
-        blind = any(not squares for squares, _ in hidden)
-        work = Counter()
-        legs = {}
-        best = [None, None]
-
-        def leg(a, b):
-            if (a, b) not in legs:
-                legs[a, b] = maze.descent(a, b)
-            return legs[a, b]
-
-        def replay(state, path, bank):
-            # A settled verdict sticks: a capsule keeps us safe, a catch stays fatal.
-            if state is None or state[0] is not None:
-                return state
-            if path is None:
-                return False, state[1], state[2]
-            # A replayed move costs one chase step per square a ghost may hold.
-            work["steps"] += (len(path) - 1) * sum(len(squares) for squares, _ in state[1])
-            return maze.survive(path, state[1], state[2], capsules, bank)
-
-        def back(q, states):
-            # Moves home through the nearest door every tracked replay survives.
-            if not states:
-                return maze.bank[q]
-            for b in sorted(maze.doors, key=lambda b: (self.dist(q, b), maze.key[b]))[:TRIP_DOORS]:
-                path = leg(q, b)
-                if all(replay(s, path, True)[0] for s in states):
-                    return self.dist(q, b)
-            return None
-
-        def grow(trip, moves, cost, value, dots, watch, alarm):
-            # watch replays the visible ghosts, alarm every defender we track.
-            if (work["evals"] >= TRIP_EVALS or work["steps"] >= TRIP_STEPS or
-                    time.perf_counter() - self.started > 0.45):
-                return
-            work["evals"] += 1
-            q = trip[-1]
-            over = carried + dots > limit
-            if over and blind:
-                return
-            states = [s for s in (watch, alarm if over else None) if s is not None]
-            home = back(q, states)
-            if home is not None:
-                rate = value / max(1, moves + TRIP_HOME * home + cost)
-                if best[0] is None or rate > best[0]:
-                    best[:] = rate, trip[0]
-            if len(trip) >= TRIP_DEPTH:
-                return
-            for n in pool:
-                if n in trip:
-                    continue
-                path = leg(q, n) if watch or alarm else None
-                step = replay(watch, path, False)
-                if step is not None and step[0] is False:
-                    continue
-                grow(trip + [n], moves + self.dist(q, n), cost + extra(n), value + 1,
-                     dots + (n not in capsules), step, replay(alarm, path, False))
-
-        # Replay the visible ghosts only when one is close and soon awake; replay
-        # everyone only if some trip could carry more than the limit.
-        watch = (None, seen, 0) if threatened else None
-        alarm = (None, every, 0) if every and carried + TRIP_DEPTH > limit else None
-        for q in pool:
-            path = maze.trace(parent, q) if watch or alarm else None
-            step = replay(watch, path, False)
-            if step is not None and step[0] is False:
-                continue
-            grow([q], costs[q], extra(q) - 1.5 * (q == self.goal), 1, int(q not in capsules),
-                 step, replay(alarm, path, False))
-        return best[1]
-
-    def verified(self, candidates, price, parent, costs, doors, capsules, ghosts, carried, choice):
-        maze = self.maze
-
-        def hurry():
-            # Backstop only; the bounded loops below finish well before it.
-            return time.perf_counter() - self.started > 0.45
-
-        def escape(q, chasers, t):
-            # Nearest doors first; the first exit the chasers cannot cut off wins.
-            for b in sorted(maze.doors, key=lambda b: self.dist(q, b))[:6]:
-                if hurry():
-                    return None
-                path = maze.descent(q, b)
-                if path and maze.survive(path, chasers, t, capsules, True)[0]:
-                    return True
-            return False
-
-        # sorted() is stable, so equal prices keep the canonical candidate order.
-        for q in sorted(candidates, key=price)[:6]:
-            if hurry():
-                return q  # out of time: unverified targets keep today's ranking
-            verdict, chasers, t = maze.survive(maze.trace(parent, q), ghosts, 0, capsules, False)
-            if verdict is None:
-                verdict = escape(q, chasers, t)
-            if verdict is not False:
-                return q
-        if carried:
-            # Nothing is safe to collect, so bank along the first exit route that holds.
-            for b in sorted(doors, key=costs.get):
-                if hurry():
-                    break
-                if maze.survive(maze.trace(parent, b), ghosts, 0, capsules, True)[0]:
-                    return b
-        return choice
 
     def safe_step(self, p, planned, ghosts, capsules, legal):
         # One-step threat check avoids a direct capture when a safer move exists.
@@ -660,33 +411,6 @@ class CapturePlayer(CaptureAgent):
             return min(((q, a) for q, a in choices if q in costs and a in legal),
                        key=lambda item: shadow(item[0]))[1]
         if sightings:
-            # An invader seen inside one of our dead ends must come back out
-            # through its mouth. Reach the mouth first and hold it; only step
-            # off to eat the invader once it comes adjacent.
-            seen = [nearest_point(state.get_agent_position(i)) for i in invaders
-                    if state.get_agent_position(i) is not None]
-            # A capsule below the mouth would scare us while we wait there.
-            baited = {maze.home_mouth.get(c) for c in self.get_capsules_you_are_defending(state)}
-            traps = []
-            for q in seen:
-                m = maze.home_mouth.get(q)
-                if m not in costs or m in baited or costs[m] > self.dist(q, m):
-                    continue
-                # With a second invader loose, a raider leaves this mouth to
-                # an unscared sentinel that gets there no later. Never the
-                # other way round: a raider at home may still be raiding.
-                if (len(invaders) > 1 and not self.guarding and mate in maze.home and
-                        not state.get_agent_state(self.mate).scared_timer and self.dist(mate, m) <= costs[m]):
-                    continue
-                traps.append((costs[m], maze.key[m], maze.key[q], m))
-            if traps:
-                # Any invader next to us is worth the step, trapped or not.
-                bites = [q for q in maze.order(seen) if costs.get(q, INF) <= 1]
-                if bites:
-                    return actions[bites[0]]
-                m = min(traps)[-1]
-                return Directions.STOP if p == m else actions[m]
-
             def priority(report):
                 i, q, weight = report
                 partner_closer = len(invaders) > 1 and self.dist(mate, q) < costs[q]
@@ -706,9 +430,9 @@ class CapturePlayer(CaptureAgent):
                     progress = sum(w * (self.dist(inv, g) - self.dist(q, g))
                                    for q, w in likely_steps.items() if self.dist(inv, q) <= 1)
                     return self.dist(inv, g) - 3 * progress
-                goal = min(maze.order(goals), key=goal_cost)
+                goal = min(sorted(goals), key=goal_cost)
             else:
-                goal = min(maze.order(goals), key=lambda q: self.dist(inv, q))
+                goal = min(sorted(goals), key=lambda q: self.dist(inv, q))
             length = self.dist(inv, goal)
             reachable = [q for q in costs if costs[q] <= self.dist(inv, q) and
                          self.dist(inv, q) + self.dist(q, goal) == length]
