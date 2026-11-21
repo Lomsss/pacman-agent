@@ -3,7 +3,7 @@
 
 Examples (run from the repository root):
     python testing/bench.py                        # every opponent, 10 fixed + 20 random maps
-    python testing/bench.py -o rusher,mcts -r 40   # two opponents, 40 random maps
+    python testing/bench.py -o rusher,mcts -r 40   # two opponents (branches agent/rusher, agent/mcts), 40 random maps
     python testing/bench.py -o git:551e486         # against an older version of our agent
     python testing/bench.py -a /tmp/candidate.py --json out.json
 
@@ -25,41 +25,54 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTEST_SRC = os.path.join(ROOT, "pacman-contest", "src")
 CONTEST = os.path.join(CONTEST_SRC, "contest")
-OPP_DIR = os.path.join(ROOT, "testing", "opponents")
-
+# Every opponent lives on its own branch, agent/<name>, as a self-contained
+# my_team.py. A name below is played from that branch (local or origin).
 OPPONENTS = {
-    "baseline": "baseline_team",
-    "double_baseline": "double_baseline_team",
-    "rusher": "rusher_team",            # two greedy attackers
-    "turtle": "turtle_team",            # two sonar-tracking defenders
-    "capsule": "capsule_team",          # capsule first, feast while ghosts are scared
-    "switcher": "switcher_team",        # roles flip with the score
-    "approxq": "approxq_team",          # linear Q-function features
-    "minimax": "minimax_team",          # alpha-beta attacker
-    "mcts": "mcts_team",                # Monte Carlo tree search attacker
-    "astar": "astar_team",              # A* path planner around visible ghosts
-    "camper": "camper_team",            # greedy attacker plus a border-mirroring camper
-    "mdp": "mdp_team",                  # value iteration over a reward grid, both roles
-    "bfs": "bfs_team",                  # plain BFS, squares next to ghosts treated as walls
-    "abfull": "abfull_team",            # full-state alpha-beta with iterative deepening
-    "mirror_attack": "mirror_attack_team",  # our own code, both on offense
+    "double-baseline": "the staff baseline with both agents attacking",
+    "rusher": "two greedy attackers",
+    "turtle": "two sonar-tracking defenders",
+    "capsule": "capsule first, feast while ghosts are scared",
+    "switcher": "roles flip with the score",
+    "approxq": "linear Q-function features",
+    "minimax": "alpha-beta attacker",
+    "mcts": "Monte Carlo tree search attacker",
+    "astar": "A* path planner around visible ghosts",
+    "camper": "greedy attacker plus a border-mirroring camper",
+    "mdp": "value iteration over a reward grid, both roles",
+    "bfs": "plain BFS, squares next to ghosts treated as walls",
+    "abfull": "full-state alpha-beta with iterative deepening",
+    "mirror-attack": "our own code, both on offense",
+    "mm": "proxy of the contest team M&M",
+    "alma": "proxy of the contest team Alma Team",
+    "ghostclaniol": "proxy of the contest team GhostClaniol",
 }
+DEFAULT = ["baseline"] + list(OPPONENTS)
 FIXED = ["defaultCapture", "alleyCapture", "bloxCapture", "crowdedCapture", "distantCapture",
          "fastCapture", "jumboCapture", "mediumCapture", "officeCapture", "strategicCapture"]
 
 
+def show(refs, tmp, label):
+    """Write my_team.py from the first ref that has it and return the path."""
+    for ref in refs:
+        out = subprocess.run(["git", "-C", ROOT, "show", f"{ref}:my_team.py"], capture_output=True, text=True)
+        if out.returncode == 0:
+            path = os.path.join(tmp, f"past_{re.sub(r'[^A-Za-z0-9]', '_', label)}_team.py")
+            with open(path, "w") as fh:
+                fh.write(out.stdout)
+            return path
+    sys.exit(f"no my_team.py at {' or '.join(refs)}; try: git fetch origin")
+
+
 def resolve(name, tmp):
     if name.startswith("git:"):
-        ref = name[4:]
-        src = subprocess.run(["git", "-C", ROOT, "show", f"{ref}:my_team.py"], capture_output=True, text=True, check=True).stdout
-        path = os.path.join(tmp, f"past_{re.sub(r'[^A-Za-z0-9]', '_', ref)}_team.py")
-        with open(path, "w") as fh:
-            fh.write(src)
-        return path
+        return show([name[4:]], tmp, name[4:])
     if name == "baseline":
         return "baseline_team"
-    if name in OPPONENTS:
-        return os.path.join(OPP_DIR, OPPONENTS[name] + ".py")
+    branch = "agent/" + name.replace("_", "-")
+    if name.replace("_", "-") in OPPONENTS:
+        return show([branch, "origin/" + branch], tmp, branch)
+    if not os.path.isfile(name):
+        sys.exit(f"unknown opponent {name!r}: use a name from OPPONENTS, git:<ref> or a file path")
     return os.path.abspath(name)
 
 
@@ -86,7 +99,7 @@ def layout_file(layout, tmp):
 
 def play(agent, opp, layout, side, length, seed=None):
     red, blue = (agent, opp) if side == "red" else (opp, agent)
-    env = dict(os.environ, PYTHONPATH=CONTEST_SRC + os.pathsep + OPP_DIR + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    env = dict(os.environ, PYTHONPATH=CONTEST_SRC + os.pathsep + os.environ.get("PYTHONPATH", ""))
     cmd = [sys.executable, "capture.py", "-r", red, "-b", blue, "-l", layout_file(layout, TMP), "-Q", "-c",
            "--delay-step", "0", "-i", str(length)]
     if seed is not None:
@@ -123,7 +136,7 @@ def play(agent, opp, layout, side, length, seed=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-a", "--agent", default=os.path.join(ROOT, "my_team.py"))
-    ap.add_argument("-o", "--opponents", default=",".join(OPPONENTS), help="comma list; names, git:<ref> or paths")
+    ap.add_argument("-o", "--opponents", default=",".join(DEFAULT), help="comma list; names (agent/<name> branches), git:<ref> or paths")
     ap.add_argument("-f", "--fixed", default=",".join(FIXED), help="fixed layouts (empty for none)")
     ap.add_argument("-r", "--random", type=int, default=20, help="number of random maps")
     ap.add_argument("-s", "--seed", type=int, default=1000, help="first random map seed")

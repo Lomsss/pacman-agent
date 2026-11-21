@@ -10,7 +10,7 @@ dots returned) and any timeouts or crashes by our agents.
 # from the repository root, with the contest submodule checked out
 python testing/bench.py                           # all opponents, 10 fixed + 20 random maps
 python testing/bench.py -o rusher,capsule -r 60   # focus on two styles, 60 random maps
-python testing/bench.py -o git:main               # play against the version on main
+python testing/bench.py -o git:7655999            # play against a past version of our agent
 python testing/bench.py -a path/to/candidate.py   # test a candidate file instead of my_team.py
 python testing/bench.py -f "" -r 40 -s 2000       # 40 random maps only, seeds 2000-2039
 ```
@@ -20,26 +20,40 @@ minutes. Results vary between runs because the agents and the sonar are
 random, so compare two versions on the same maps (`-s`) and treat a
 difference under about 0.1 points per game as noise.
 
-## Opponents (`testing/opponents/`)
+## Opponents (one branch each)
 
-| name | style |
-|---|---|
-| `baseline` | the staff baseline team |
-| `double_baseline` | the baseline with both agents attacking |
-| `rusher` | two greedy attackers that carry 6 dots and only flee ghosts within 2 squares |
-| `turtle` | two defenders with sonar tracking that split the doors |
-| `capsule` | an attacker that goes for the capsule first and feasts while ghosts are scared, plus a defender |
-| `switcher` | roles follow the score: both attack when behind, both defend when ahead late |
-| `approxq` | a linear Q-function over hand-tuned features (what approximate Q-learning produces), plus a defender |
-| `minimax` | an alpha-beta attacker against the ghosts it can see, plus a defender |
-| `mcts` | a Monte Carlo tree search attacker (UCT with rollouts), plus a defender |
-| `astar` | an A* attacker that plans whole paths around the ghosts it can see, plus a defender |
-| `camper` | a greedy attacker plus a defender that camps on the border level with the nearest enemy |
-| `mdp` | value iteration over a reward grid (food, capsules, home when loaded, ghost penalties), both roles |
-| `bfs` | plain BFS: nearest dot with squares next to a ghost treated as walls, and a chasing defender |
-| `abfull` | full-state alpha-beta with iterative deepening over `generate_successor`, 0.25 s per move |
-| `mirror_attack` | our own code with both agents attacking |
-| `git:<ref>` | any past version of `my_team.py` |
+Every opponent lives on its own branch, `agent/<name>`, where `my_team.py`
+is that agent as one self-contained file. `bench.py` reads it with
+`git show`, from the local branch or `origin/agent/<name>`, so run
+`git fetch origin` once after cloning. Nothing needs to be checked out.
+
+| name | branch | style |
+|---|---|---|
+| `baseline` | (in the contest) | the staff baseline team |
+| `double-baseline` | `agent/double-baseline` | the baseline with both agents attacking |
+| `rusher` | `agent/rusher` | two greedy attackers that carry 6 dots and only flee ghosts within 2 squares |
+| `turtle` | `agent/turtle` | two defenders with sonar tracking that split the doors |
+| `capsule` | `agent/capsule` | an attacker that goes for the capsule first and feasts while ghosts are scared, plus a defender |
+| `switcher` | `agent/switcher` | roles follow the score: both attack when behind, both defend when ahead late |
+| `approxq` | `agent/approxq` | a linear Q-function over hand-tuned features (what approximate Q-learning produces), plus a defender |
+| `minimax` | `agent/minimax` | an alpha-beta attacker against the ghosts it can see, plus a defender |
+| `mcts` | `agent/mcts` | a Monte Carlo tree search attacker (UCT with rollouts), plus a defender |
+| `astar` | `agent/astar` | an A* attacker that plans whole paths around the ghosts it can see, plus a defender |
+| `camper` | `agent/camper` | a greedy attacker plus a defender that camps on the border level with the nearest enemy |
+| `mdp` | `agent/mdp` | value iteration over a reward grid (food, capsules, home when loaded, ghost penalties), both roles |
+| `bfs` | `agent/bfs` | plain BFS: nearest dot with squares next to a ghost treated as walls, and a chasing defender |
+| `abfull` | `agent/abfull` | full-state alpha-beta with iterative deepening over `generate_successor`, 0.25 s per move |
+| `mirror-attack` | `agent/mirror-attack` | our main agent as of the split, with both agents attacking |
+| `mm` | `agent/mm` | proxy of the contest team M&M (reproduces 599/600 replay moves) |
+| `alma` | `agent/alma` | proxy of the contest team Alma Team (97% of replay moves) |
+| `ghostclaniol` | `agent/ghostclaniol` | proxy of the contest team GhostClaniol (97% of replay moves) |
+| `git:<ref>` | any | `my_team.py` at any commit or branch, e.g. `git:agent/v2`, `git:origin/Cursor`, `git:7655999` |
+
+The proxies were rebuilt from contest replays; their branch docs list the
+inferred rules, the likely algorithm and the weaknesses seen in the games.
+`agent/v2`, `agent/contest-agent` and `agent/mm-replay-proxy` are not in
+the default list; play them with `git:agent/<name>`. To change an opponent,
+commit to its branch; `bench.py` always plays the branch tip.
 
 All opponents only use what the game gives every agent (their own
 observation, maze distances and noisy sonar), so results reflect what a
@@ -52,7 +66,7 @@ Repeating a layout in `-f` plays it again with fresh random sonar:
 
 ```bash
 D=$(python3 -c "print(','.join(['defaultCapture'] * 20))")
-python testing/bench.py -f "$D" -r 0 -o astar,capsule,git:main   # 40 games per opponent
+python testing/bench.py -f "$D" -r 0 -o astar,capsule,git:7655999   # 40 games per opponent
 ```
 
 Treat the other maps as a robustness check. On one map, a difference needs
@@ -68,14 +82,17 @@ so effects of about 0.1 points per game show up in a few hundred games.
 
 ```bash
 D=$(python3 -c "print(','.join(['defaultCapture'] * 20))")
-OPP=astar,bfs,mdp,switcher,git:main,git:origin/codex/crowded-stalls,git:origin/Cursor
+OPP=astar,bfs,mdp,switcher,git:7655999,git:origin/codex/crowded-stalls,git:origin/Cursor
 python testing/bench.py -a my_team.py   -o $OPP -f "$D" -r 0 --game-seed s1 --json ref.json
 python testing/bench.py -a candidate.py -o $OPP -f "$D" -r 0 --game-seed s1 --json new.json
 python testing/paired.py ref.json new.json
 ```
 
 These seven opponents are the "hard suite": the ones that do not lose every
-game on defaultCapture, so they separate two versions. Confirm a gain on a
+game on defaultCapture, so they separate two versions. `git:7655999` is the
+PR #5 agent; pin past versions by commit, because `git:main` moves whenever
+a PR is merged and then plays the agent against itself. For other maps and
+the contest-team styles, add `mm,alma,ghostclaniol` and maps to `-f`. Confirm a gain on a
 second seed (`s2`) before keeping it, and run the full opponent list once to
 check nothing else got worse. Opponents that stop searching on a clock
 (`abfull`, `minimax`, `mcts`) do not replay exactly.
@@ -91,5 +108,16 @@ ghosts eaten, capsules eaten, moves on the enemy side, the largest load,
 who scored first, lead changes and the score after each quarter.
 
 ```bash
-python testing/match_stats.py -a my_team.py -b testing/opponents/astar_team.py -f "$D" -r 0
+python testing/match_stats.py -a my_team.py -b astar -f "$D" -r 0
+```
+
+## Replaying one game (`why.py`)
+
+`why.py` replays one seeded game and prints the score every 100 moves and
+every death, bank, capsule and scared-ghost kill, so a lost game can be
+inspected move by move:
+
+```bash
+python testing/why.py --from-json ref.json --index 17        # game 17 of a bench run
+python testing/why.py -r my_team.py -b astar -l defaultCapture --seed "s1:astar:defaultCapture:3:red"
 ```

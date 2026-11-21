@@ -4,7 +4,7 @@
 Takes the same seed string that `bench.py --game-seed` stores in its JSON
 (`seed` field), so a lost game can be replayed exactly and inspected:
 
-    python testing/why.py -r my_team.py -b testing/opponents/astar_team.py \
+    python testing/why.py -r my_team.py -b astar \
         -l defaultCapture --seed "s1:astar:defaultCapture:3:red"
     python testing/why.py --from-json runs/x.json --index 17   # replay game 17 of a bench run
 
@@ -21,11 +21,10 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTEST_SRC = os.path.join(ROOT, "pacman-contest", "src")
 CONTEST = os.path.join(CONTEST_SRC, "contest")
-OPP_DIR = os.path.join(ROOT, "testing", "opponents")
 
 
 def replay(red, blue, layout, seed, length=1200, map_file=False):
-    sys.path[:0] = [CONTEST_SRC, OPP_DIR, os.path.dirname(os.path.abspath(__file__))]
+    sys.path[:0] = [CONTEST_SRC, os.path.dirname(os.path.abspath(__file__))]
     if map_file:
         # Runs made after bench.py loaded RANDOM maps from files: do the same.
         import tempfile
@@ -73,6 +72,16 @@ def replay(red, blue, layout, seed, length=1200, map_file=False):
             "agents": [type(a).__name__ for a in game.agents], "timeline": timeline, "events": events}
 
 
+def team(name):
+    """A file path, or a bench name / git:<ref> fetched the way bench.py does."""
+    if os.path.exists(name):
+        return os.path.abspath(name)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tempfile
+    from bench import resolve
+    return resolve(name, tempfile.mkdtemp(prefix="why_"))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-r", "--red")
@@ -86,12 +95,12 @@ def main():
     if args.from_json:
         g = json.load(open(args.from_json))[args.index]
         ours = os.path.abspath(args.agent or os.path.join(ROOT, "my_team.py"))
-        opp = g["opponent"] if os.path.isabs(g["opponent"]) else os.path.join(OPP_DIR, g["opponent"] + "_team.py")
+        opp = team(g["opponent"])
         red, blue = (ours, opp) if g["side"] == "red" else (opp, ours)
         layout, seed, map_file = g["layout"], g["seed"], g.get("map_file", False)
         print(f"bench recorded: result {g.get('result')} margin {g.get('margin')} for us as {g['side']}")
     else:
-        red, blue, layout, seed = os.path.abspath(args.red), os.path.abspath(args.blue), args.layout, args.seed
+        red, blue, layout, seed = team(args.red), team(args.blue), args.layout, args.seed
         map_file = layout.startswith("RANDOM")
     r = replay(red, blue, layout, seed, map_file=map_file)
     print(f"{layout} seed={seed}  final score {r['score']:+d} (positive = red ahead) after {r['moves']} moves")
