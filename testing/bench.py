@@ -45,6 +45,8 @@ OPPONENTS = {
     "mm": "proxy of the contest team M&M",
     "alma": "proxy of the contest team Alma Team",
     "ghostclaniol": "proxy of the contest team GhostClaniol",
+    "cursor": "the Cursor team (Cursor agent V1.2)",
+    "crowded-stalls": "the crowded-stalls team, ancestor of the main agent",
 }
 DEFAULT = ["baseline"] + list(OPPONENTS)
 FIXED = ["defaultCapture", "alleyCapture", "bloxCapture", "crowdedCapture", "distantCapture",

@@ -367,7 +367,7 @@ GhostClaniol proxies 97%. All three are deterministic BFS, reflex or shallow
 max-min agents, and none predicts our moves.
 
 Our five best agents each played these three proxies and an earlier, rougher
-M&M proxy (`agent/mm-replay-proxy`): 28 games per pairing on 14 maps. This
+M&M proxy (since removed): 28 games per pairing on 14 maps. This
 agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
 31-1-0 on defaultCapture.
 
@@ -425,13 +425,14 @@ Only this agent lives on `main`. Every other team has its own branch named
 | `agent/v2` | the second-generation team (formerly `my_team_v2.py`) |
 | `agent/contest-agent` | the earlier `ContestAgent` team |
 | `agent/abfull`, `agent/approxq`, `agent/astar`, `agent/bfs`, `agent/camper`, `agent/capsule`, `agent/double-baseline`, `agent/mcts`, `agent/mdp`, `agent/minimax`, `agent/mirror-attack`, `agent/rusher`, `agent/switcher`, `agent/turtle` | sparring opponents (styles in `testing/README.md`) |
-| `agent/mm`, `agent/alma`, `agent/ghostclaniol`, `agent/mm-replay-proxy` | contest-team proxies |
+| `agent/cursor` | the Cursor team (Cursor agent V1.2) |
+| `agent/crowded-stalls` | the crowded-stalls team, which this agent grew from |
+| `agent/mm`, `agent/alma`, `agent/ghostclaniol` | contest-team proxies |
 
-The existing `Cursor` and `codex/crowded-stalls` branches stay as they are.
 On every agent branch `my_team.py` is that agent, self-contained, with a
 `docs/AGENT.md` describing it. `testing/bench.py -o astar` plays the branch
 `agent/astar` (local or `origin/`); `-o git:<branch>` plays any branch,
-for example `-o git:agent/v2` or `-o git:origin/Cursor`.
+for example `-o git:agent/v2` or `-o git:7655999` (the PR #5 agent).
 
 ## 8. Testing
 
