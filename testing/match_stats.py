@@ -8,7 +8,7 @@ when the team first scored, how many times the lead changed, and the score
 after a quarter, half and three quarters of the game.
 
 Examples (from the repository root):
-    python testing/match_stats.py -a my_team.py -b testing/opponents/rusher_team.py -r 20
+    python testing/match_stats.py -a my_team.py -b rusher -r 20
     python testing/match_stats.py -a my_team.py -b other.py -f crowdedCapture,jumboCapture -r 0 --json out.json
 
 Each map is played twice, with A as red and then as blue.
@@ -17,17 +17,19 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
+
+from bench import resolve
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTEST_SRC = os.path.join(ROOT, "pacman-contest", "src")
 CONTEST = os.path.join(CONTEST_SRC, "contest")
-OPP_DIR = os.path.join(ROOT, "testing", "opponents")
 
 
 def _play(job):
     red, blue, layout, length = job
-    sys.path[:0] = [CONTEST_SRC, OPP_DIR]
+    sys.path[:0] = [CONTEST_SRC]
     os.chdir(CONTEST)
     import io
     import contextlib
@@ -104,7 +106,7 @@ def _play(job):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-a", required=True, help="team A file")
-    ap.add_argument("-b", required=True, help="team B file (or baseline)")
+    ap.add_argument("-b", required=True, help="team B: a file, or a bench.py name / git:<ref>")
     ap.add_argument("-f", "--fixed", default="", help="comma list of fixed layouts")
     ap.add_argument("-r", "--random", type=int, default=10)
     ap.add_argument("-s", "--seed", type=int, default=5000)
@@ -113,7 +115,7 @@ def main():
     ap.add_argument("--json")
     args = ap.parse_args()
     a = os.path.abspath(args.a)
-    b = "baseline_team" if args.b == "baseline" else os.path.abspath(args.b)
+    b = os.path.abspath(args.b) if os.path.exists(args.b) else resolve(args.b, tempfile.mkdtemp(prefix="stats_"))
     layouts = [l for l in args.fixed.split(",") if l] + [f"RANDOM{args.seed + k}" for k in range(args.random)]
     jobs, sides = [], []
     for lay in layouts:
