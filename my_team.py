@@ -28,7 +28,7 @@ TRIP_EVALS, TRIP_STEPS = 600, 60000
 TRIP_HOME = 0.36
 
 
-def create_team(first_index, second_index, is_red, first="Raider", second="Sentinel",
+def create_team(first_index, second_index, is_red, first="Raider", second="Raider",
                 num_training=0, prediction="1", lookahead="0", **kwargs):
     """Default to position tracking. Set prediction=0 or test one-turn replies with lookahead=1."""
     classes = {"Raider": Raider, "Sentinel": Sentinel}
