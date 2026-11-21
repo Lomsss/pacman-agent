@@ -1,448 +1,106 @@
-# Main agent (my_team.py)
+# Agent branch `agent/ghostclaniol`
 
-`my_team.py` is a two-agent capture team: a `Raider` that collects food and a
-`Sentinel` that guards our side. Both are the same class, `CapturePlayer`; the
-only difference is the `guarding` flag, and either agent can raid or defend on
-any turn. On the seven opponents that still take points from us on
-defaultCapture it scores about 2.5 points a game, and against the
-contest-team proxies it scored 2.83 points a game. Read sections 2.3 (roles)
-and 2.4 (raid) first: most of the behaviour lives there.
+**Proxy of the contest team GhostClaniol, reverse-engineered from a replay.**
 
-## 1. How to run it
+This branch holds a behavioural proxy of a real contest team, rebuilt from
+contest replays. It is not that team's code: it reproduces the decision rules
+seen in the replays. The main agent and the test tools are on `main`.
+
+`my_team.py` is self-contained (shared helpers inlined), so it can be played
+directly or from `main` with `python testing/bench.py -o ghostclaniol`.
 
 ```bash
-cd pacman-contest/src/contest/
+cd pacman-contest/src/contest
 python capture.py -r ../../../my_team.py -b baseline_team
-# with team options
-python capture.py -r ../../../my_team.py -b baseline_team --redOpts "lookahead=1"
 ```
 
-`create_team` options:
-
-| Option | Default | Effect |
-|---|---|---|
-| `prediction` | `"1"` | Track hidden enemies with `OpponentModel`. `0`, `false` or `off` uses only visible positions. |
-| `lookahead` | `"0"` | `1`, `true` or `on` adds the one-turn reply forecast (`OpponentModel.replies`) to raid risk and interception. Off by default after a paired ablation (db2c5fd). |
-| `first` | `"Raider"` | Class of the first agent (`Raider` or `Sentinel`; unknown names fall back to `Raider`). |
-| `second` | `"Sentinel"` | Class of the second agent (unknown names fall back to `Sentinel`). |
-
-## 2. Design
-
-### 2.1 `Maze`: map analysis (built once in `register_initial_state`)
-
-- **Canonical order.** `key` maps each square to itself for red and to its
-  180-degree rotation for blue. `order()` sorts by `key`, the heap in
-  `routes` breaks ties by `key`, and blue tries moves in `BLUE_STEPS`
-  (the mirror of `STEPS`). Every tie therefore breaks the same way for both
-  colours. Before this change blue played a differently tuned agent: it
-  scored 0.70 points a game against an exact copy of itself.
-- **Edges, home, doors.** `edges` lists each square's open neighbours in
-  canonical order. `home` is our half. `doors` are home squares with a
-  neighbour on the enemy side.
-- **Distances.** `rows` holds a BFS distance row per source. On boards up to
-  650 open squares every square is a source. On bigger boards only the first
-  32 doors are, and `dist` falls back to Manhattan distance between two
-  squares that both lack a row. Unreachable is 999.
-- **`bank`.** Each square's distance to the nearest door.
-- **Dead ends.** `peel(side)` repeatedly removes degree-1 squares on one side
-  of the map. Each removed square maps to the first square outside its
-  pocket, its mouth. `mouth` covers enemy-side pockets (the raider must pass
-  the mouth again to get home). `home_mouth` covers our pockets whose mouth
-  is on our side (an invader inside must come back out through it).
-- **`routes(origin, legal, risk, home_only, parent)`.** One uniform-cost
-  search that prices every goal at once. Step cost is `1 + risk[q]`. It
-  stops after 850 expansions. It returns the cost and the first action for
-  every reached square, and optionally a `parent` map that `trace` walks
-  back into a path.
-- **`descent(q, goal)`.** A shortest path built from the distance rows,
-  taking the first closer neighbour in canonical order. Gives up after 200
-  squares.
-- **`chase(squares, target)`.** The squares a chasing ghost may hold after one
-  move: from each possible square, every stay-or-step on its own side that
-  gets closest to `target`. Ties are all kept (pessimistic). The set is
-  capped at the 12 squares closest to the target.
-- **`survive(path, ghosts, t, capsules, bank)`.** Walks the path one move at
-  a time against ghosts given as (squares, scared timer). It returns `True`
-  when the path reaches a capsule (or home, if `bank`), `False` when a ghost
-  that is no longer scared at that time can be on our square (checked before
-  and after the ghosts move), and `None` if the path ends with us still
-  exposed.
-
-### 2.2 `OpponentModel`: tracking
-
-One histogram filter per enemy, started at its spawn square.
-
-- **Visible enemy.** The belief collapses to its square. If it was also
-  visible on our previous turn, the step since then is returned as
-  `direction`.
-- **Hidden enemy.** The belief spreads one step (equal shares to staying and
-  to each neighbour). Squares survive only if they are on the side that fits
-  the enemy's pacman flag, more than 5 Manhattan squares from both our
-  agents (otherwise we would see it), and possible under our own sonar
-  reading. If nothing survives (for example after a respawn), every
-  compatible square gets equal weight.
-- **Eaten food.** For an invader, squares where our food or capsule just
-  disappeared get 9 times the weight. Both invaders get the boost, since
-  either could be responsible.
-- The 40 likeliest squares are kept and normalised. `update` returns the top
-  4 as (square, weight) for the planners.
-- **`replies`** (only with `lookahead=1`). Forecasts the enemy's next square:
-  its 3 nearest goals are weighted by closeness, a step that gains on a goal
-  weighs 4.0, no change 1.0, losing 0.35 (reversed for a fleeing ghost,
-  scared timer above 1), and a step that repeats the visible motion is
-  multiplied by 1.6. Goals in `observe`: doors for an invader carrying 2 or more,
-  otherwise our food and capsules; for a ghost, whichever of our agents is
-  on the enemy side, otherwise the doors.
-
-Our agents do not share memory. Each keeps its own models.
-
-### 2.3 `choose_action`: turn pipeline and roles
-
-Setup and helpers: `register_initial_state` builds the `Maze`, one
-`OpponentModel` per enemy (only with `prediction`), `quota` and the memories
-below. `resources` is the set of food and capsules we defend. `observe`
-updates the models (or, with `prediction=0`, returns only visible enemies)
-and builds the `replies` forecast. `get_maze_distance` keeps the
-`CaptureAgent` distance API working on top of `Maze.dist`. `manhattan` is the
-plain grid distance.
-
-Each turn: start the timer, return the only legal action if there is one,
-record our square in `recent` (last 12), detect missing food or capsules
-(`bite` is the nearest one, `bite_age` counts turns since), update the
-models, then pick a role. `moves` is `(timeleft + 3) // 4`, our own moves
-left (300 at the start).
-
-| Flag | Rule |
-|---|---|
-| `double_cover` | Two invaders, and we are the sentinel, or we are a ghost while our mate is on the enemy side. A raider already across (a pacman) does not count, so it finishes its trip. |
-| `emergency` | `double_cover`, or we lead with fewer than 24 moves left. |
-| `visible_near` | A visible invader within 2 squares. |
-| `assist` | No invaders and (we are scared for more than 8, we trail, or fewer than 245 moves left and we do not lead); or scared for more than 15 with one invader. |
-| defend | `(guarding and not assist) or emergency or visible_near`, and only while we are a ghost. |
-| `recall` | Passed to `raid` for a sentinel out raiding when an invader appears and we are scared for less than 5. `emergency` also recalls. |
-
-So the sentinel defends unless `assist` holds, and the raider defends only
-in emergencies or when a visible invader is within 2. A pacman never runs
-`defend`; under `emergency` or `recall` it heads home instead.
-Any action not in `legal` is replaced by `legal[0]`.
-
-### 2.4 `raid`: the attacker
-
-**Risk map.** For each enemy ghost with scared timer 5 or less and each of
-its likely squares, every enemy-side square within distance 4 (not a
-capsule) gets `weight * (60, 38, 10, 2.8, 0.8)[d]`. These are twice the
-original crowded-stalls weights; the raider was dying 3 times a game against
-a door-holding guard on defaultCapture. Food inside an enemy dead end gets
-`danger` of `weight * min(16, 3 + 2 * depth)` when the ghost could reach the
-mouth no more than one move after we get back out. With `lookahead`, forecast
-squares add `18 * probability`. Each repeat visit in `recent` adds 0.65.
-
-**When to bank.** `limit` is 3 when level or ahead, 5 when behind. With food
-carried, `cash` is true if any of these hold:
-
-- what we returned plus what we carry reaches `quota` (half the total dots,
-  minus 2);
-- `moves <= bank[p] + 8` (the clock is running out);
-- `full_load`: `carried >= limit` and the nearest dot is more than 1 away,
-  or `carried >= limit + 2`;
-- the cheapest door costs 2 or less;
-- the nearest dot is at least `bank[p] + 3` away.
-
-**Exit pricing.** While we are a pacman and a ghost with scared timer 3 or
-less is visible, each door costs `costs[b] + 3 * max(0, 2 - lead)`, where
-`lead` is how many moves sooner we reach it than the nearest such ghost.
-If we carry food and the lead at the chosen door is between -1 and 3, we
-bank now. A pacman that must bank (`cash`, `recall` or no food left) heads
-for that door through `safe_step`.
-
-**Target price.** Candidates are all food and capsules reached by `routes`.
-
-```
-price(q) = costs[q] + 0.36 * bank[q] + extra(q) - 1.5 * (q == goal)
-extra(q) = danger[q] + 12 if within 3 of a taboo square
-           - capsule_bonus if q is a capsule
-           + 4 if our mate is on the enemy side and more than 1 move closer
-```
-
-`capsule_bonus` is 4 when fewer than 5 dots are left or some tracked enemy
-has scared timer below 7 (in practice almost always), otherwise 1. The 1.5
-bonus keeps the current goal unless another is clearly better.
-
-**Stand-off breaking.** `cycling` means the last five squares alternate
-A-B-A-B-A. When cycling, with a goal and the score level or behind:
-
-- if the last 4 goals were all the same (a guard keeps turning us back),
-  that goal becomes `taboo` for 20 raid turns (targets within 3 of it pay
-  +12; it is a price penalty, not a ban);
-- otherwise (the target keeps flipping), `lock` commits to the current goal
-  for 8 turns.
-
-When ahead we keep the stand-off, because it runs the clock for us. With the
-double risk weights this was the PR #5 change: 2.52 to 2.80 points a game on
-defaultCapture.
-
-**Choosing.** If a lock is active, keep the locked goal. Otherwise take the
-cheapest price, then, while we are a pacman or within 1 of a door, ask
-`trips` for a better first stop. If `trips` returns nothing and a visible,
-unscared ghost is within 7, `verified` picks the target. A pacman's step
-always goes through `safe_step`.
-
-### 2.5 `trips`: multi-dot trip planner
-
-Plans ordered trips of up to `TRIP_DEPTH` (3) stops from the `TRIP_POOL` (8)
-best-priced candidates and returns the first stop of the best one. A trip
-scores
-
-```
-rate = stops / max(1, moves + TRIP_HOME * home + cost)
-```
-
-where `moves` is the first leg's route cost plus the plain distances of later
-legs, `cost` sums `extra` over the stops (minus the 1.5 goal bonus on the
-first), and `home` is the distance back. `TRIP_HOME` is 0.36, the home weight
-in `price`, so a one-stop trip home through the nearest door ranks as
-`price` does.
-
-Safety checks replay `survive` along the trip:
-
-- `watch` replays the visible ghosts. It is on when a visible ghost with
-  scared timer 5 or less is within 10 (`threat`). A trip whose leg is caught
-  is cut.
-- `alarm` replays every defender, hidden ones at their likeliest squares. It
-  only matters for trips that would carry more than `limit`; such a trip
-  scores only if every tracked replay survives. With no belief for some
-  hidden defender (`blind`, e.g. `prediction=0`), trips over the limit are
-  dropped (neither scored nor extended).
-- `back` tries the `TRIP_DOORS` (3) nearest doors and uses the first one all
-  active replays survive. If none does, the trip does not score. With no
-  active replay it uses `bank[q]`.
-
-Work is capped by counters, not the clock, so seeded games replay exactly:
-at most `TRIP_EVALS` (600) trip evaluations and `TRIP_STEPS` (60000) replayed
-ghost-square moves. A 0.45 s clock check is a backstop only; if it ever
-fired, that game would no longer replay exactly. The slowest move measured
-was about 0.1 s.
-
-Measured: +0.08 +- 0.09 and +0.24 +- 0.08 on two seed sets of the hard
-suite; A\* +0.45 / +0.55, which reversed the A\* dip from verification.
-
-### 2.6 `verified`: route check against a chasing ghost
-
-Used when `trips` finds no trip and a visible ghost with scared timer 0 is
-within 7. The
-six best-priced targets are tried in price order. For each, the route
-(`trace`) is replayed against the visible ghosts with `chase`. If the route
-ends still exposed, `escape` tries the six nearest doors with `descent`. The
-first target that is not caught wins. If none is safe and we carry food, it
-banks along the first door route (cheapest first) that survives. Otherwise
-the plain cheapest target stands. A 0.45 s check returns early.
-
-Measured: +0.33 / +0.16 alone on the hard suite; deaths against the BFS
-team fell from about 2.7 to 1.2 a game in a 6-game check. Each move uses at
-most about 2 ms.
-
-### 2.7 `safe_step`: last-step check
-
-With a visible active ghost (scared timer 3 or less), if the planned step
-lands within 1 of it, take another legal step (or stop) that does not. Home
-squares and capsules count as safe. Among safe steps, prefer the least
-visited in `recent`, then the farthest from the ghost. If no step is safe,
-keep the plan.
-
-### 2.8 `defend`: the guard
-
-Routes stay on our side (`routes(..., home_only=True)`, no risk).
-
-1. **Scared shadowing.** While scared and an invader is tracked, stay about
-   3 squares from it: score `max(0, 3 - near) * 10 + abs(near - 3)`, then
-   prefer squares near a door.
-2. **Dead-end trap.** For each visible invader inside one of our pockets, if
-   we reach its `home_mouth` no later than it does, hold the mouth (stop on
-   it). Mouths with our capsule below them are skipped, since the capsule
-   would scare us there. With two invaders, the raider leaves a mouth to an
-   unscared sentinel at home that gets there no later; never the other way
-   round. An invader 1 step away is eaten first. Measured +0.10 / +0.19.
-3. **Interception.** Pick the invader with the lowest
-   `costs[q] + 6 * partner_closer - 2 * min(4, carrying) - 3 * weight`. Eat
-   it if visible and adjacent. Otherwise assume its goal is the nearest door
-   when it carries 2 or more, else our nearest food or capsule. With
-   `lookahead`, the goal among these that best fits the forecast replies
-   is used instead of the nearest. Go to the square on its shortest
-   path to that goal, nearest to the invader, that we reach no later than it.
-4. **Door re-cover.** With no invaders and not scared: if an enemy was a
-   pacman on one of our doors on our previous turn and is now visible one
-   step from that door, go back to that door.
-5. **Bite chase.** With invaders, go to the last eaten square until 6 turns
-   after it vanished (`bite_age <= 6`).
-6. **Patrol.** Choose the door minimising mean distance to the 4 nearest
-   defended items, plus `0.8 *` the smallest `distance + 4 * (1 - w)` over
-   enemy estimates on their side, plus `0.1 *` our route cost, plus `0.25 *`
-   mean distance to all doors.
-
-## 3. Constants
-
-| Name / place | Value | Meaning |
-|---|---|---|
-| `STEPS`, `BLUE_STEPS` | E W N S / W E S N | Move order per colour |
-| `TRIP_POOL` | 8 | Targets a trip may draw from |
-| `TRIP_DEPTH` | 3 | Stops per trip |
-| `TRIP_DOORS` | 3 | Exits tried per trip |
-| `TRIP_EVALS` | 600 | Trip evaluations per move |
-| `TRIP_STEPS` | 60000 | Replayed ghost-square moves per move |
-| `TRIP_HOME` | 0.36 | Weight of the return leg in a trip |
-| `INF` | `float("inf")` | Unreached cost |
-| `Maze`: BFS cut-off | 650 squares, 32 doors | Above this, rows only from doors |
-| `routes` cap | 850 expansions | Search bound |
-| `chase` cap | 12 squares | Ghost set size |
-| `descent` cap | 200 squares | Path length bound |
-| Tracking | 5 sight, x9 bite, top 40, 4 returned | `OpponentModel.update` |
-| Replies | 3 goals, 4.0 / 1.0 / 0.35, x1.6, flee if scared > 1 | `OpponentModel.replies` |
-| Unreachable | 999 | `dist`, `bank` |
-| `recent`, `goal_hist` | 12, 4 | Memory lengths |
-| `quota` | total dots / 2 - 2 | Bank everything at this point |
-| Roles | 24, 2, 8, 245, 15, 5 | `emergency`, `visible_near`, `assist`, `recall` |
-| Risk weights | 60, 38, 10, 2.8, 0.8 | Ghost at distance 0..4; ghosts scared > 5 ignored |
-| Dead-end danger | slack <= 1, `min(16, 3 + 2d)` | Food in enemy pockets |
-| Forecast risk | 18 | Per unit reply probability |
-| Revisit cost | 0.65 | Per repeat in `recent` |
-| `limit` | 3 / 5 | Carry limit when level or ahead / behind |
-| Cash rules | +8, 2, +3, `limit + 2` | Clock, door cost, far food, full load |
-| Exit pricing | ghosts scared <= 3, `3 * max(0, 2 - lead)`, window -1..3 | Door choice and early bank |
-| `capsule_bonus` | 4 / 1 | Fewer than 5 dots or an enemy scared < 7 |
-| Price | 0.36 home, 1.5 goal, +4 mate, +12 taboo (radius 3) | `price`, `extra` |
-| Stand-off | taboo 20, lock 8 | Raid turns |
-| Trip threat | scared <= 5 within 10 | Turns on `watch` |
-| Trip gate | pacman or `bank[p] <= 1` | When `trips` runs |
-| Verification | unscared within 7, 6 targets, 6 doors | `verified` |
-| Clock backstop | 0.45 s | `trips`, `verified` |
-| `safe_step` | slack > 1, home/capsule = 8 | Last-step check |
-| Shadow | 3 squares | Scared guard distance |
-| Interception | 6, 2 x min(4, carrying), 3, carry >= 2 | Priority and invader goal |
-| Bite chase | 6 turns | `bite_age` |
-| Patrol | 4 items, 0.8, 4, 0.1, 0.25 | `coverage` |
-
-## 4. Rules and timing
-
-- All live inputs come from the agent's own observation: its state, visible
-  positions, noisy sonar, food and capsule grids, score and time left. It
-  never reads or changes the opponents' objects or the engine.
-- No threads, no files, no shared module state between our two agents.
-- Deterministic: ties follow the canonical order, and search is capped by
-  work counters, so a seeded game against a deterministic opponent replays
-  move for move (unless a 0.45 s clock check fires).
-- Time: the slowest move measured was about 0.1 s; the 0.45 s clock checks
-  are a backstop. Startup is the BFS distance table.
-- Python: the file uses only the Python 3.8 grammar and library. Played on
-  3.9.6 and 3.12. Not yet run on the UPF cluster.
-
-## 5. Results
-
-Points are 3 per win and 1 per tie, per game. The "hard suite" is the seven
-opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
-`mdp`, `switcher`, the PR #5 agent, crowded-stalls and Cursor.
-
-### Lineage
-
-| Commit | Change | Measured gain |
-|---|---|---|
-| e74870e | crowded-stalls replaces the previous `ContestAgent` | Head to head 104-12-24; suite 2.12 to 2.62 (40 random maps); 59-1-0 on defaultCapture |
-| dc189ef / 7655999 (PR #5) | Stand-off breaking, ghost risk x2 | defaultCapture, 13 opponents, 320 games: 2.52 to 2.80. Cursor 1.25 to 2.35, A\* 1.95 to 2.25, capsule 2.25 to 3.00. Other maps flat (2.59 to 2.58). x1.5 and x3 scored less. |
-| 0b8e9be | Colour-symmetric tie-breaks | Hard suite, 420 games: blue 2.15 to 2.33 (red 2.57 to 2.44, code unchanged, noise). Blue vs exact copy 0.70 to 1.23; blue vs A\* 1.57 to 2.73. |
-| b655d2a | Route verification + dead-end trap | Paired, hard suite: +0.41 / +0.24 (verification alone +0.33 / +0.16, trap alone +0.10 / +0.19). Full suite +0.02 +- 0.06. A\* about -0.17 +- 0.13. |
-| 3188c01 | Multi-dot trips | +0.08 +- 0.09 / +0.24 +- 0.08; A\* +0.45 / +0.55; full suite +0.06 +- 0.05 |
-
-### Latest numbers
-
-- Hard suite, PR #5 agent to this agent: 1.99 to 2.48 and 2.10 to 2.59 on
-  two seed sets (about +0.5 a game). The other ten opponents are unchanged.
-- Wider reference suite (10 opponents, 16 maps, 2 seed sets, 640 games):
-  2.40 points a game.
-
-### Contest-team study
-
-Two real contest replays were reverse-engineered into proxy teams:
-match_150085 (GhostClaniol vs M&M) and match_150100 (M&M vs Alma Team). The
-M&M proxy reproduces 599 of 600 recorded moves in each game; the Alma and
-GhostClaniol proxies 97%. All three are deterministic BFS, reflex or shallow
-max-min agents, and none predicts our moves.
-
-Our five best agents each played these three proxies and an earlier, rougher
-M&M proxy (`agent/mm-replay-proxy`): 28 games per pairing on 14 maps. This
-agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
-31-1-0 on defaultCapture.
-
-### Head to head
-
-| Match | Games | W-T-L | Points |
-|---|---|---|---|
-| crowded-stalls vs previous `ContestAgent` | 140 | 104-12-24 | 2.31 |
-| crowded-stalls vs previous `ContestAgent` (defaultCapture) | 60 | 59-1-0 | 2.97 |
-| PR #5 agent vs v2 (defaultCapture) | 120 | 59-8-53 | 1.54 |
-| 0b8e9be agent as blue vs an exact copy of itself (was 0.70 before the tie-break fix) | not recorded | not recorded | 1.23 (even is 1.5) |
-
-## 6. Tried and dropped
-
-| Idea | Result | Why it failed |
-|---|---|---|
-| Runtime opponent identification | Not built | An adversarial review cut it. Nearly every field opponent shares the behaviours a label would detect, so the default play already handles them; a label only adds false-positive risk. Its main consumer, the reply forecast, is off. Agents also persist across games and both see every enemy move, which made the evidence easy to miscount. |
-| Danger from every square a visible ghost reaches first | -0.87 | Walls off half the map; the raider is too timid |
-| Sentinel hangs back near our capsule | +0.03, but -0.25 vs A\* | Lets the A\* attacker through |
-| Guard our capsule during interception | A\* 1.95 to 1.57 | Same: lets the attacker through |
-| Double defence to protect a late lead | -0.09 | Gives up points in close games |
-| Wider verification (all targets, all doors, 10 squares) | -0.04 / +0.09 | More of the same check does not pay |
-| Defender search against the field's attacker pattern | -0.03 / -0.02 alone; -0.41 / -0.39 with trips | Wins vs A\* and BFS, loses mirror matches once the raider is away on long trips |
-| Risk weights x1.5 or x3 | Lower than x2 | x2 kept |
-| Deep escape search (both ghosts, up to 8 rounds) | 1.98 vs 2.29 (screening) | Planning for a perfect guard makes the raider too careful |
-| Short escape search (2 rounds) | Cursor 2.40 to 2.55, A\* 2.17 to 1.70 | Net loss |
-| Scared ghost walks into the invader to respawn | 2.00 / 1.95 vs 2.31 | We bank 1.4 dots a game less; the scared sentinel stops counter-raiding |
-| Teammate sonar fusion (v2) | Tracking error 5.03 to 4.54 and 5.58 to 4.19 squares; no points change | Not adopted |
-| Forced-capture search for the sentinel (v2) | 2.31 vs 2.29 | Rarely fires; a lone invader can usually step back |
-| v2 as a whole | 2.77 vs 2.75 suite; 53-8-59 head to head | Level, not better |
-| Feast (carry more while enemy ghosts are scared) | +0.01 +- 0.03; defaultCapture -0.16 +- 0.10 | Loses on the contest map |
-| Capsule break-out from stand-offs | +0.02 +- 0.03; defaultCapture -0.06 +- 0.07 | No gain |
-| Map-scaled carry limit | +0.01 +- 0.02; defaultCapture unchanged | No gain |
-| Hunt cornered scared ghosts | +0.01 +- 0.02 | No gain |
-| Loss fix: keeper | +0.00 +- 0.04 | No gain (defaultCapture hard suite) |
-| Loss fix: escape | -0.08 | Lower; not kept |
-| Loss fix: walk-in | -0.09 | Lower; not kept |
-| Loss fix: clock | -0.03 | Lower; not kept |
-| Loss fix: scare | -0.06 | Lower; not kept |
-
-The four variants from the contest-team data were each paired over 640 games
-(10 opponents, 16 maps, 2 seed sets; reference 2.40). The open weakness
-from the v2 study (measured on the PR #5 agent and v2): the A\* attacker and
-Cursor ate our capsule in 40 of 40 games each, and the A\* attacker banked
-5.0 of its 7.9 dots a game during the scare. None of the counters tried
-(capsule guard, scare reset, two escape searches) paid.
-
-## 7. Other agents
-
-Only this agent lives on `main`. Every other team has its own branch named
-`agent/<name>`:
-
-| Branch | Agent |
-|---|---|
-| `agent/v2` | the second-generation team (formerly `my_team_v2.py`) |
-| `agent/contest-agent` | the earlier `ContestAgent` team |
-| `agent/abfull`, `agent/approxq`, `agent/astar`, `agent/bfs`, `agent/camper`, `agent/capsule`, `agent/double-baseline`, `agent/mcts`, `agent/mdp`, `agent/minimax`, `agent/mirror-attack`, `agent/rusher`, `agent/switcher`, `agent/turtle` | sparring opponents (styles in `testing/README.md`) |
-| `agent/mm`, `agent/alma`, `agent/ghostclaniol`, `agent/mm-replay-proxy` | contest-team proxies |
-
-The existing `Cursor` and `codex/crowded-stalls` branches stay as they are.
-On every agent branch `my_team.py` is that agent, self-contained, with a
-`docs/AGENT.md` describing it. `testing/bench.py -o astar` plays the branch
-`agent/astar` (local or `origin/`); `-o git:<branch>` plays any branch,
-for example `-o git:agent/v2` or `-o git:origin/Cursor`.
-
-## 8. Testing
-
-See `testing/README.md`. In short:
-
-- `bench.py --game-seed` seeds every game, so two versions play the same
-  games, and against deterministic opponents a seeded game replays move for
-  move. `paired.py` compares two runs game by game.
-- Test on defaultCapture first (the contest map), with about 40 games per
-  opponent; other maps are a robustness check.
-- Keep rule: a change is kept only if it gains on two independent seed sets
-  of the hard suite and a run against the full opponent list shows no other
-  loss. Treat differences under about 0.1 points a game as noise.
-- `match_stats.py` and `why.py` explain why a game was won or lost.
+## What it does (from the module docstring)
+
+Proxy of the student team "GhostClaniol" (replay 150085, red).
+
+Reverse-engineered from one contest replay. Both agents are one-step
+reflex agents: each legal move is scored on simple features of the square
+it leads to; remaining ties go to the move the engine lists last.
+
+Attacker (first index): walks the shortest path to the nearest dot. Squares
+within 3 steps of a visible unscared ghost are walls for that path, and a
+dead-end pocket is not entered while a ghost could reach its mouth before
+we got back out. It banks once it carries 5, or as soon as home is nearer
+than the next dot; on the way home it still takes one dot a step away. It
+ignores invaders and never hunts scared ghosts on purpose (it eats them
+only when they stand on its path). Near the end it enters a pocket anyway
+if the ghost could not reach it before time runs out.
+
+Defender (second index): patrols the map centre (width // 2, height // 2).
+On the red side that square is the first enemy column, so the defender
+shuttles across the border every turn. It chases a visible invader by maze
+distance (crossing the border if that is shorter), runs from it while
+scared, and as a pacman keeps more than 4 steps from an unscared ghost.
+Staying home wins ties. It never reacts to dots vanishing out of sight.
+
+## Reverse-engineered behaviour
+
+### Pure attacker: a greedy dot-eater that avoids ghosts, never defends and never deliberately hunts scared ghosts. It banked all 20 points over 5 trips (3, 5, 1, 6, 5).
+
+Replay agent: 0
+
+- Opening: takes the shortest maze path to the nearest enemy dot, (20,16) at distance 63. The capsule at (19,16) happened to lie on that path; every off-path step in plies 0-248 is an eating step.
+- Target: the nearest dot by maze distance. When a visible ghost is near, the path routes around the squares within 3 of that ghost. Examples: at 904-936 it detoured from (16,1) through (14,1)-(14,5) and (16,5) instead of going through the ghost on row 1; at 928 it chose E over S, which tie on plain distance and differ on the ghost-aware path.
+- Ghost avoidance: it never steps to a square within maze distance 3 of a visible ghost that is not scared (scared timer 5 or less still counts as dangerous). Distance 4 is allowed. At 860 it retreated from (24,4) with the ghost at 4, because N would have put it at 3. At 956/960 it advanced with the ghost at distance 4. Moving the threshold to 4 drops junction agreement from 0.946 to 0.849, and 2 gives 0.946.
+- Dead-end pockets: it does not enter a pocket while a ghost could reach the pocket mouth before it got back out. At 1036, 1084 and 1132 it was at (27,3) with the ghost at (26,5), distance 3, and refused the food square (27,2) at the mouth of a 4-square pocket. It looped the same 12-step cycle around a block 3 times instead. Removing this rule costs 6 junction plies.
+- Endgame: at 1180, in the same state with only 5 own moves left, it dived into the pocket and ate 4 more dots, ending with 7 carried. It ignores the pocket danger when the game ends before the ghost could follow it in.
+- Banking: it heads home when carrying 5 or more, or as soon as it carries anything and home is strictly closer than the next dot. Cases: 268 (carry 3, home 4 vs dot 15), 480 (carry 1, home 2 vs dot 5), 408/764 (carry 5). On the way home it still takes a dot one step away: at 592 it ate (24,16) while carrying 5. A limit of 5 fits best: 4 gives 0.914, 6 gives 0.925, no limit gives 0.882. Dropping the home-closer-than-dot rule costs 6 plies.
+- Scared ghosts: it ignores them. At 600-660 it walked home carrying 6 with a scared ghost at distance 2 and did not hunt it. It eats one only when it stands on its path: at 388 it moved onto e3 (scared 5) at the food square (22,13).
+- Invaders: it ignores them. It only Stopped twice, at 704 and 708 on (16,1), while an invader carrying 4 was visible about 18 away. That trigger is unexplained.
+- Ties: among a0's equal moves, 3 went to the later move in engine order (692, 696 and 1188, which was E over W) and 2 to the earlier one (300 S over E, 524 N over E). This looks like random tie-breaking. The proxy sends ties to the move listed last.
+
+### Defender posted at the map centre (width//2, height//2) = (17,9). On the red side that square is the first enemy column, so the defender crosses the border every turn: (16,9) E then (17,9) W, more than 200 times. It ate no dots.
+
+Replay agent: 2
+
+- Post: the map centre square (W//2, H//2). The opening is the exact shortest path from (1,1) to (17,9), distance 64, with no off-path step before ply 258. After fleeing it walks the same path back (342-382, 582-606).
+- At (16,9) going E reaches the post. At (17,9) it is a pacman and N, S and W all tie at distance 1. W, the move back home, wins every time (23 such ties, 0 exceptions), and it never Stops on the post. Home preference also explains the ties at 490 (N over E) and 798 (S over E). This is a one-step reflex with an on-defense or home bonus smaller than one step of post distance, plus a Stop penalty.
+- Visible invader and not scared: it moves to minimise the maze distance to the invader and crosses the border when that is shorter. At 418-446 it went (16,10), (17,10), (17,11), (17,12), (16,12), then west along row 12 behind e1 at distance 4. It does not cut off routes or predict the invader.
+- Scared with an invader visible: it runs away to maximise distance from the invader on our own side, from as far as 10 away (486). At 286-338 it fled from (16,9) all the way to (7,6). At 518-574 it fled from (16,9) to (14,4). When the invader goes out of sight it walks back to the post.
+- As a pacman it avoids an unscared ghost within 4: at 714/718, with e1 just turned ghost at (18,12)/(19,12), it stayed home and stepped N/S instead of E. It treats a ghost with 5 or less scared time as dangerous: at 670, with e3 scared 5 at (17,7), it went S rather than E. A scared ghost on the next square gets eaten: at 678 it killed e3 (scared 3) on (17,9).
+- It ignores dots vanishing out of sight. From ply 746 to 1198 the invader e1 grazed the top-left (7..16,12..16) out of sight and banked several times. a2 kept shuttling at the centre.
+- Unexplained deviations, about 10 plies (786-798, 914/918, 938 Stop, 942/946, 974/978, 1198 Stop, 706 Stop): small N/S/Stop moves near the post while an invader was out of sight. They are probably sonar-driven and cannot be reproduced, because the harness noise is not the game's noise.
+
+## Likely algorithm
+
+A hand-written two-role team with no adversarial search.
+- Attacker: each turn it runs a BFS (shortest path) to the nearest enemy dot, or to the home border once it carries 5 or home is strictly closer than the next dot. Squares within maze distance 3 of a visible unscared ghost count as walls. It has a dead-end check that is dropped in the last few moves. It never stops voluntarily, and its ties look random. It has no capsule or scared-ghost logic and no defensive role.
+- Defender: a one-step reflex agent of the baseline DefensiveReflexAgent kind. It heads for a fixed post at (width//2, height//2). It gets a small bonus for standing on its own side, which produces the perfect (16,9)/(17,9) shuttle on red, and a Stop penalty. It closes in on visible invaders by maze distance, flees them while scared without leaving its side, and as a pacman avoids unscared ghosts within 4. It may use sonar faintly, given about 6 unexplained small moves toward out-of-sight invaders.
+- Unexplained: the simultaneous team Stops at 704-708.
+
+## Exploitable weaknesses (verified against the replays)
+
+- The defender reacts only to invaders it can see. It ignores dots disappearing and invaders out of sight, apart from rare small steps. From 746 to 1198 M&M farmed the top-left and banked 4 times while a2 shuttled at the centre. Attack through lanes far from (W//2, H//2).
+- On red, the post is the first enemy column, so the defender is a pacman one step over the border every other turn and covers no other door.
+- Once their team is scared, the defender flees to maximise distance from any visible invader (it fled to (7,6) at 286-338 and to (14,4) at 518-574). Eating their capsule (the one on our side) therefore opens their side for about 40 moves. M&M banked 6 and 5 right after its two capsules.
+- The chase is pure maze distance with no interception. It trailed an invader at exactly 4 for 30 plies without gaining. An invader moving away is never caught. It crosses the border when the shortest path does, but not always (it Stopped at 706).
+- The attacker can be herded. A ghost holding 4 away drove it home with 0 food (860-900). A ghost holding 3 from a pocket mouth kept it looping a 12-move cycle for about 150 plies carrying 3; it never banked, and those 3 dots plus 4 more were lost at the end.
+- The attacker refuses dead-end pockets while a ghost could reach the mouth. Food in pockets is safe from it while a defender sits nearby, except in the last few moves, when it dives in.
+- Banking is predictable: home at 5 carried (6 if a dot is adjacent at 5), or as soon as home is strictly closer than the next dot. It walks the shortest ghost-free path, so a defender waiting on the border near its return route intercepts it.
+- The attacker never defends and ignores invaders. It never hunts scared ghosts (it walked past one with 17 scared moves left at 620) and takes capsules only when they lie on its food path. Our scared ghosts are safe from it unless they stand on its path.
+- M&M lost no ghost to a deliberate hunt: both blue respawns came from a blue ghost walking into a0 (387) or a2 walking to its post (678). Do not expect scared-ghost kills from this team.
+
+## How faithful the proxy is
+
+After the fix, match_150085.replay, ghostclaniol_team.py as red: all 0.970 (582/600), junctions 0.950 (285/300). Agent 0: 0.973, junctions 0.946 (88/93). Agent 2: 0.967, junctions 0.952 (197/207). This is identical to before the fix and identical with --seed 3. As blue on the same replay, against M&M (for interest only): junctions 0.714. a2's junction count is inflated by about 110 trivial shuttle plies at (16,9), which the harness counts as junctions because 3 non-Stop moves are legal there. On the 98 non-shuttle a2 plies after the opening it is about 90%. Sensitivity checks: SCARED_SAFE 0-3 gives 0.947 overall junctions (a2 196/207), SCARED_SAFE 10 gives 0.947, removing the endgame pocket clause gives 0.947 (a0 87/93), no home bonus gives 0.923 (a2 189/207), and random ties give 0.903-0.933.
+
+Medium. The rules are map-general and fit the replay very well: 0.950 junction agreement, independent of seed, with both agents' trajectories reproduced almost move for move. But they come from one game on one map, playing only as red, so several parts rest on very few plies:
+- the post rule (W//2, H//2), which only this one red game supports (any rule that lands on (17,9) here would fit), so its behaviour on blue and on other maps is extrapolated;
+- the endgame pocket dive (1 ply);
+- the 'one extra dot at the limit' rule (1 ply);
+- the defender's scared-5 danger threshold (1 ply).
+
+The attacker's core rules (BFS around a radius-3 ghost block, carry 5 or home closer than the next dot, pocket refusal, ignoring invaders and scared ghosts) were each seen many times and should carry over well. The defender's sonar-like deviations and the team Stops are not modelled. Ties are broken by engine order, not at random, which is a colour asymmetry. In sparring games its statistics look like the replay on defaultCapture as red: attacker a pacman about 70% of moves with small banks, defender a pacman about a third of moves through the shuttle.
+
+Claims from the first analysis that a reviewer refuted:
+
+- The claim 'at 388 a0 moved onto e3 (scared 5) at the food square (22,13)' is wrong. The respawn event for agent 3 is at ply 387, on blue's own move: a3, scared 5, stepped West from (22,13) onto pacman a0 at (21,13) and died. At 388 a0 only ate the food at (22,13). So a0 never ate a scared ghost on its own move in this game. The kill was a scared M&M ghost walking into a0. At 384, the move that put a0 next to that ghost was forced: N, S and Stop all ended within 3 of it, so food decided.
+- The claim that a0 treats a ghost with 5 or fewer scared moves as dangerous has no support in a0's moves. No a0 ply tells the thresholds apart: SCARED_SAFE = 0, 2 or 3 leaves a0 at 88/93 junctions. The only evidence for the value 5 is one defender ply, 670: a2 went S rather than E with e3 (scared 5) at distance 2. That ply could just as well be driven by sonar.
+- 'It crosses for real only when the shortest chase path runs through enemy squares (418-430, 466-482)' is half wrong. During 466-482 a2 was scared (36 to 33) and the invader was out of sight. It was walking back to the post through (17,12), (17,11), (17,10), because (16,11) is a wall. It was not chasing. Also at 706, with the invader visible at (16,12) at distance 4, it Stopped instead of crossing E, which would have cut the distance to 3. So 'crosses whenever that is shorter' does not always hold.
+- 'At (17,9) W wins in 23 such ties' undercounts. a2 played W from (17,9) all 73 times: 69 with an invader known to be a pacman but out of sight, 4 with none. The direction of the claim is right.
+- The analyst calls both agents one-step reflex agents with no search. That is not right for a0. The detour at 904-936 and the retreat at 860-900 need a path search in which squares near the ghost count as walls, which is BFS-style planning every turn. A per-step feature cannot produce them. The proxy itself uses BFS (path_dist). The no-search description fits only the defender.
