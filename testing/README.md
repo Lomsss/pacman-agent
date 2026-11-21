@@ -47,12 +47,14 @@ is that agent as one self-contained file. `bench.py` reads it with
 | `mm` | `agent/mm` | proxy of the contest team M&M (reproduces 599/600 replay moves) |
 | `alma` | `agent/alma` | proxy of the contest team Alma Team (97% of replay moves) |
 | `ghostclaniol` | `agent/ghostclaniol` | proxy of the contest team GhostClaniol (97% of replay moves) |
-| `git:<ref>` | any | `my_team.py` at any commit or branch, e.g. `git:agent/v2`, `git:origin/Cursor`, `git:7655999` |
+| `cursor` | `agent/cursor` | the Cursor team (Cursor agent V1.2) |
+| `crowded-stalls` | `agent/crowded-stalls` | the crowded-stalls team, which the main agent grew from |
+| `git:<ref>` | any | `my_team.py` at any commit or branch, e.g. `git:agent/v2`, `git:7655999` |
 
 The proxies were rebuilt from contest replays; their branch docs list the
 inferred rules, the likely algorithm and the weaknesses seen in the games.
-`agent/v2`, `agent/contest-agent` and `agent/mm-replay-proxy` are not in
-the default list; play them with `git:agent/<name>`. To change an opponent,
+`agent/v2` and `agent/contest-agent` are not in the default list; play
+them with `git:agent/v2` and `git:agent/contest-agent`. To change an opponent,
 commit to its branch; `bench.py` always plays the branch tip.
 
 All opponents only use what the game gives every agent (their own
@@ -82,7 +84,7 @@ so effects of about 0.1 points per game show up in a few hundred games.
 
 ```bash
 D=$(python3 -c "print(','.join(['defaultCapture'] * 20))")
-OPP=astar,bfs,mdp,switcher,git:7655999,git:origin/codex/crowded-stalls,git:origin/Cursor
+OPP=astar,bfs,mdp,switcher,git:7655999,crowded-stalls,cursor
 python testing/bench.py -a my_team.py   -o $OPP -f "$D" -r 0 --game-seed s1 --json ref.json
 python testing/bench.py -a candidate.py -o $OPP -f "$D" -r 0 --game-seed s1 --json new.json
 python testing/paired.py ref.json new.json
