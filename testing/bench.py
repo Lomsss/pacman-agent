@@ -11,8 +11,11 @@ Each map is played twice, once with us as red and once as blue.
 Points use the usual tournament scheme: win 3, tie 1, loss 0.
 """
 import argparse
+import contextlib
+import io
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -60,10 +63,31 @@ def resolve(name, tmp):
     return os.path.abspath(name)
 
 
+def layout_file(layout, tmp):
+    """Write RANDOM<n> maps to a file so the engine never regenerates them.
+
+    capture.py builds RANDOM<n> layouts with maze_generator, which calls
+    random.seed(n) after --setRandomSeed was applied. That overwrites the game
+    seed, so every game on that map, both colours included, would share one
+    random stream. Loading the same map from a file keeps the game seed.
+    """
+    if not layout.startswith("RANDOM"):
+        return layout
+    path = os.path.join(tmp, f"{layout}Capture.lay")
+    if not os.path.exists(path):
+        sys.path.insert(0, CONTEST_SRC)
+        import contest.maze_generator as maze_generator
+        state = random.getstate()
+        with open(path, "w") as fh, contextlib.redirect_stdout(io.StringIO()):
+            fh.write(maze_generator.generate_maze(int(layout[6:])))
+        random.setstate(state)
+    return path
+
+
 def play(agent, opp, layout, side, length, seed=None):
     red, blue = (agent, opp) if side == "red" else (opp, agent)
     env = dict(os.environ, PYTHONPATH=CONTEST_SRC + os.pathsep + OPP_DIR + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    cmd = [sys.executable, "capture.py", "-r", red, "-b", blue, "-l", layout, "-Q", "-c",
+    cmd = [sys.executable, "capture.py", "-r", red, "-b", blue, "-l", layout_file(layout, TMP), "-Q", "-c",
            "--delay-step", "0", "-i", str(length)]
     if seed is not None:
         cmd += ["--setRandomSeed", seed]
@@ -112,6 +136,10 @@ def main():
     layouts = [l for l in args.fixed.split(",") if l] + [f"RANDOM{args.seed + k}" for k in range(args.random)]
     agent = os.path.abspath(args.agent)
     tmp = tempfile.mkdtemp(prefix="bench_")
+    global TMP
+    TMP = tmp
+    for l in layouts:
+        layout_file(l, tmp)  # build every map once, before the worker threads start
     opps = [o for o in args.opponents.split(",") if o]
     paths = {o: resolve(o, tmp) for o in opps}
     jobs = [(o, l, side, k) for o in opps for k, l in enumerate(layouts) for side in ("red", "blue")]
@@ -120,7 +148,8 @@ def main():
     def run(job):
         o, l, side, k = job
         seed = None if args.game_seed is None else f"{args.game_seed}:{o}:{l}:{k}:{side}"
-        return dict(play(agent, paths[o], l, side, args.length, seed), opponent=o, layout=l, side=side, seed=seed)
+        return dict(play(agent, paths[o], l, side, args.length, seed), opponent=o, layout=l, side=side, seed=seed,
+                    map_file=l.startswith("RANDOM"))
 
     with ThreadPoolExecutor(args.jobs) as ex:
         results = list(ex.map(run, jobs))
