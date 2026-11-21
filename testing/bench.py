@@ -53,6 +53,34 @@ FIXED = ["defaultCapture", "alleyCapture", "bloxCapture", "crowdedCapture", "dis
          "fastCapture", "jumboCapture", "mediumCapture", "officeCapture", "strategicCapture"]
 
 
+POINTS = {1: 3, 0: 1, -1: 0}
+
+
+def map_weighted(values):
+    """Mean and standard error with every map weighted equally.
+
+    values is a list of (layout, number) pairs. Games on one layout,
+    repeats and both colours included, are averaged first; the result is
+    the plain mean of those per-map means, so a map played 20 times counts
+    as much as one played once.
+    """
+    groups = {}
+    for layout, v in values:
+        groups.setdefault(layout, []).append(v)
+    if not groups:
+        return 0.0, 0.0
+    flat = [v for vs in groups.values() for v in vs]
+    mean_all = sum(flat) / len(flat)
+    pooled = sum((v - mean_all) ** 2 for v in flat) / max(1, len(flat) - 1)
+    mean = sum(sum(vs) / len(vs) for vs in groups.values()) / len(groups)
+    var = 0.0
+    for vs in groups.values():
+        m = sum(vs) / len(vs)
+        s2 = sum((v - m) ** 2 for v in vs) / (len(vs) - 1) if len(vs) > 1 else pooled
+        var += s2 / len(vs)
+    return mean, var ** 0.5 / len(groups)
+
+
 def show(refs, tmp, label):
     """Write my_team.py from the first ref that has it and return the path."""
     for ref in refs:
@@ -112,12 +140,15 @@ def play(agent, opp, layout, side, length, seed=None):
         return {"result": None, "note": "harness timeout"}
     text = out.stdout + out.stderr
     ours = (0, 2) if side == "red" else (1, 3)
-    issues = []
-    for idx in ours:
+    other = "blue" if side == "red" else "red"
+    issues, opp_issues = [], []
+    for idx in range(4):
         if re.search(rf"Agent {idx} (timed out|took too long|exceeded|ran out of time)", text):
-            issues.append(f"agent {idx} time")
+            (issues if idx in ours else opp_issues).append(f"agent {idx} time")
     if re.search(rf"{side.capitalize()} agent crashed", text) or "Traceback" in text:
         issues.append("crash/traceback")
+    if re.search(rf"{other.capitalize()} agent crashed", text):
+        opp_issues.append("crash")
     early = re.search(r"The (Red|Blue) team has returned at least", text)
     won = re.search(r"The (Red|Blue) team wins by (\d+) points", text)
     if early:
@@ -132,7 +163,7 @@ def play(agent, opp, layout, side, length, seed=None):
         margin, result, early_flag = 0, 0, False
     else:
         return {"result": None, "note": text[-300:]}
-    return {"result": result, "margin": margin, "early": early_flag, "issues": issues}
+    return {"result": result, "margin": margin, "early": early_flag, "issues": issues, "opp_issues": opp_issues}
 
 
 def main():
@@ -169,7 +200,9 @@ def main():
     with ThreadPoolExecutor(args.jobs) as ex:
         results = list(ex.map(run, jobs))
 
-    print(f"\n{'opponent':16s} {'W':>4s} {'T':>4s} {'L':>4s}  {'win%':>5s} {'tie%':>5s}  {'pts/g':>5s}  {'margin':>6s}  {'early W/L':>9s}  issues")
+    # pts/map weights every map equally (repeats of a layout count once);
+    # pts/g is the plain per-game mean.
+    print(f"\n{'opponent':16s} {'W':>4s} {'T':>4s} {'L':>4s}  {'win%':>5s} {'tie%':>5s}  {'pts/map':>12s}  {'pts/g':>5s}  {'margin':>6s}  {'early W/L':>9s}  issues")
     total = {"w": 0, "t": 0, "l": 0, "n": 0}
     for o in opps:
         rs = [r for r in results if r["opponent"] == o]
@@ -179,11 +212,14 @@ def main():
         ew = sum(r["early"] and r["result"] > 0 for r in ok); el = sum(r["early"] and r["result"] < 0 for r in ok)
         issues = sum(bool(r.get("issues")) for r in rs) + (len(rs) - len(ok))
         n = max(1, len(rs))
-        print(f"{o:16s} {w:4d} {t:4d} {l:4d}  {100*w/n:5.1f} {100*t/n:5.1f}  {(3*w+t)/n:5.2f}  "
+        mean, se = map_weighted([(r["layout"], POINTS[r["result"]]) for r in ok])
+        print(f"{o:16s} {w:4d} {t:4d} {l:4d}  {100*w/n:5.1f} {100*t/n:5.1f}  {mean:5.2f} ± {se:4.2f}  {(3*w+t)/n:5.2f}  "
               f"{(sum(margins)/max(1,len(margins))):+6.1f}  {ew:4d}/{el:<4d}  {issues}")
         total["w"] += w; total["t"] += t; total["l"] += l; total["n"] += len(rs)
     n = max(1, total["n"])
-    print(f"{'ALL':16s} {total['w']:4d} {total['t']:4d} {total['l']:4d}  {100*total['w']/n:5.1f} {100*total['t']/n:5.1f}  {(3*total['w']+total['t'])/n:5.2f}")
+    mean, se = map_weighted([(r["layout"], POINTS[r["result"]]) for r in results if r["result"] is not None])
+    print(f"{'ALL':16s} {total['w']:4d} {total['t']:4d} {total['l']:4d}  {100*total['w']/n:5.1f} {100*total['t']/n:5.1f}  "
+          f"{mean:5.2f} ± {se:4.2f}  {(3*total['w']+total['t'])/n:5.2f}")
     bad = [r for r in results if r["result"] is None or r.get("issues")]
     for r in bad[:20]:
         print("  issue:", r["opponent"], r["layout"], r["side"], r.get("issues") or r.get("note", "")[:200])
