@@ -15,6 +15,12 @@ python testing/bench.py -a path/to/candidate.py   # test a candidate file instea
 python testing/bench.py -f "" -r 40 -s 2000       # 40 random maps only, seeds 2000-2039
 ```
 
+`pts/map` weights every map equally: the games on one layout (repeats and
+both colours) are averaged first, then the maps are averaged. So repeating
+`defaultCapture` 20 times in `-f` gives it more games, which narrows its
+error bar, but not more weight. `pts/g` is the plain per-game mean.
+`paired.py` and `tournament.py` weight maps the same way.
+
 A full run is several hundred games. With 4 cores it takes roughly 5 to 10
 minutes. Results vary between runs because the agents and the sonar are
 random, so compare two versions on the same maps (`-s`) and treat a
@@ -123,3 +129,22 @@ inspected move by move:
 python testing/why.py --from-json ref.json --index 17        # game 17 of a bench run
 python testing/why.py -r my_team.py -b astar -l defaultCapture --seed "s1:astar:defaultCapture:3:red"
 ```
+
+## Round-robin tournament (`tournament.py`)
+
+`tournament.py` plays every pair of entrants on every map, once with each
+colour, and ranks them the way the contest does: 3 points for a win, 1 for
+a tie, points per game with every map weighted equally. It also prints a
+head-to-head table.
+
+```bash
+python testing/tournament.py --json t1.json             # every agent branch plus main, 10 fixed + 6 random maps
+python testing/tournament.py -t main=my_team.py,v2=git:agent/v2,astar,mm -f defaultCapture -r 4
+python testing/tournament.py --resume t1.json -t "$(cat teams.txt),new=cand.py" --json t2.json
+```
+
+With `--resume`, games already played between the same entrants on the
+same map and seed are reused, so adding one entrant only plays its pairs.
+Every agent is played on 16 maps x 2 colours against each other agent, so
+the full default field (23 entrants) is about 8,000 games; abfull, mcts and
+the contest agent think on a clock, so those pairs take most of the time.

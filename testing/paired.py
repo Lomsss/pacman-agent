@@ -11,20 +11,15 @@ result changed carry information, which makes small effects measurable.
 """
 import collections
 import json
-import math
+import os
 import sys
 
-POINTS = {1: 3, 0: 1, -1: 0}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench import POINTS, map_weighted  # noqa: E402
 
 
 def load(path):
     return {g["seed"]: g for g in json.load(open(path)) if g.get("result") is not None}
-
-
-def stat(values):
-    mean = sum(values) / len(values)
-    sd = math.sqrt(sum((x - mean) ** 2 for x in values) / max(1, len(values) - 1))
-    return mean, sd / math.sqrt(len(values))
 
 
 def main():
@@ -32,16 +27,18 @@ def main():
     common = [s for s in ref if s in new]
     if not common:
         sys.exit("no games in common: were both runs made with the same --game-seed?")
+    # Every map weighs the same: differences are averaged per layout first.
     per = collections.defaultdict(list)
     for s in common:
-        per[ref[s]["opponent"].split("/")[-1]].append(POINTS[new[s]["result"]] - POINTS[ref[s]["result"]])
+        per[ref[s]["opponent"].split("/")[-1]].append(
+            (ref[s]["layout"], POINTS[new[s]["result"]] - POINTS[ref[s]["result"]]))
     for opponent, diffs in sorted(per.items()):
-        mean, se = stat(diffs)
-        print(f"{opponent:28} {mean:+.2f} +- {se:.2f}  (changed {sum(d != 0 for d in diffs)}/{len(diffs)})")
-    mean, se = stat([d for diffs in per.values() for d in diffs])
-    before = sum(POINTS[ref[s]["result"]] for s in common) / len(common)
-    after = sum(POINTS[new[s]["result"]] for s in common) / len(common)
-    print(f"{'ALL':28} {mean:+.3f} +- {se:.3f}  n={len(common)}  {before:.3f} -> {after:.3f} pts/game")
+        mean, se = map_weighted(diffs)
+        print(f"{opponent:28} {mean:+.2f} +- {se:.2f}  (changed {sum(d != 0 for _, d in diffs)}/{len(diffs)})")
+    mean, se = map_weighted([d for diffs in per.values() for d in diffs])
+    before, _ = map_weighted([(ref[s]["layout"], POINTS[ref[s]["result"]]) for s in common])
+    after, _ = map_weighted([(new[s]["layout"], POINTS[new[s]["result"]]) for s in common])
+    print(f"{'ALL':28} {mean:+.3f} +- {se:.3f}  n={len(common)}  {before:.3f} -> {after:.3f} pts/game, maps weighted equally")
 
 
 if __name__ == "__main__":
