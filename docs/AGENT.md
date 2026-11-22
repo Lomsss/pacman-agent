@@ -6,7 +6,8 @@ only difference is the `guarding` flag, and either agent can raid or defend on
 any turn. On the seven opponents that still take points from us on
 defaultCapture it scores about 2.5 points a game, and against the
 contest-team proxies it scored 2.83 points a game. Read sections 2.3 (roles)
-and 2.4 (raid) first: most of the behaviour lives there.
+and 2.4 (raid) first: most of the behaviour lives there. The defender's
+main tool is a chase game solved once per map (sections 2.1 and 2.8).
 
 ## 1. How to run it
 
@@ -67,6 +68,17 @@ python capture.py -r ../../../my_team.py -b baseline_team --redOpts "lookahead=1
   that is no longer scared at that time can be on our square (checked before
   and after the ghosts move), and `None` if the path ends with us still
   exposed.
+- **`contain(capsules)` and `holds(d, i)`.** The defender's chase game,
+  solved once at setup by working backwards over every pair of home squares
+  (our ghost, one invader), with either side to move. The invader wins by
+  stepping home, onto one of our capsules (even with our ghost on it: the
+  engine eats the capsule before it checks the catch) or more than `SIGHT`
+  (5) squares from our ghost, where we could no longer see it; or by forcing
+  such a position. `holds(d, i)` lists the ghost's moves from `d`, staying
+  included, after which an invader on `i` can never win: eating it, or a
+  square the solution keeps. Capsules are the ones present at the start of
+  the game. The solve takes under 0.2 s (jumboCapture, 301 home squares).
+  `testing/check_contain.py` re-derives every position from the rules.
 
 ### 2.2 `OpponentModel`: tracking
 
@@ -262,19 +274,31 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
    would scare us there. With two invaders, the raider leaves a mouth to an
    unscared sentinel at home that gets there no later; never the other way
    round. An invader 1 step away is eaten first. Measured +0.10 / +0.19.
-3. **Interception.** Pick the invader with the lowest
+3. **Choice.** Pick the invader with the lowest
    `costs[q] + 6 * partner_closer - 2 * min(4, carrying) - 3 * weight`. Eat
-   it if visible and adjacent. Otherwise assume its goal is the nearest door
+   it if visible and adjacent.
+4. **Containment.** If that invader is visible and `holds(p, invader)` is
+   not empty, play the holding move nearest to it. Food only scores once it
+   is brought home, so an invader that can never get home gains nothing,
+   and staying as close as the solution allows keeps the pressure on. A
+   chase from behind never closes; this is what lost mediumCapture to
+   crowded-stalls (a 13-dot trip with our ghost 1 to 3 squares behind).
+   Paired gains over the agent without it, on four seed sets: +0.69, +0.25,
+   +0.14, +0.33 points a game. Head to head (320 games, 16 maps):
+   crowded-stalls 1.51 to 1.85, v2 1.65 to 2.02. defaultCapture is
+   unchanged (0 of 144 games changed): there the holds the solver finds
+   while keeping the invader in sight are rare.
+5. **Interception.** Otherwise assume its goal is the nearest door
    when it carries 2 or more, else our nearest food or capsule. With
    `lookahead`, the goal among these that best fits the forecast replies
    is used instead of the nearest. Go to the square on its shortest
    path to that goal, nearest to the invader, that we reach no later than it.
-4. **Door re-cover.** With no invaders and not scared: if an enemy was a
+6. **Door re-cover.** With no invaders and not scared: if an enemy was a
    pacman on one of our doors on our previous turn and is now visible one
    step from that door, go back to that door.
-5. **Bite chase.** With invaders, go to the last eaten square until 6 turns
+7. **Bite chase.** With invaders, go to the last eaten square until 6 turns
    after it vanished (`bite_age <= 6`).
-6. **Patrol.** Choose the door minimising mean distance to the 4 nearest
+8. **Patrol.** Choose the door minimising mean distance to the 4 nearest
    defended items, plus `0.8 *` the smallest `distance + 4 * (1 - w)` over
    enemy estimates on their side, plus `0.1 *` our route cost, plus `0.25 *`
    mean distance to all doors.
@@ -298,6 +322,7 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 | Tracking | 5 sight, x9 bite, top 40, 4 returned | `OpponentModel.update` |
 | Replies | 3 goals, 4.0 / 1.0 / 0.35, x1.6, flee if scared > 1 | `OpponentModel.replies` |
 | Unreachable | 999 | `dist`, `bank` |
+| `SIGHT` | 5 | Engine sight range; `contain` counts an invader beyond it as escaped |
 | `recent`, `goal_hist` | 12, 4 | Memory lengths |
 | `quota` | total dots / 2 - 2 | Bank everything at this point |
 | Roles | 24, 2, 8, 245, 15, 5 | `emergency`, `visible_near`, `assist`, `recall` |
@@ -330,8 +355,13 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 - Deterministic: ties follow the canonical order, and search is capped by
   work counters, so a seeded game against a deterministic opponent replays
   move for move (unless a 0.45 s clock check fires).
-- Time: the slowest move measured was about 0.1 s; the 0.45 s clock checks
-  are a backstop. Startup is the BFS distance table.
+- Time: measured on all 16 test maps in both colours, 4 games at a time:
+  slowest move 56 ms, setup at most 0.19 s (jumboCapture), about 1.1 s of
+  thinking per game for both agents together. The engine's limits are 15 s
+  for setup, a warning for a move over 1 s (the third warning loses), 3 s
+  for an instant forfeit and 900 s per agent per game. The 0.45 s clock
+  checks are a backstop. Setup is the BFS distance table and the
+  containment solve.
 - Python: the file uses only the Python 3.8 grammar and library. Played on
   3.9.6 and 3.12. Not yet run on the UPF cluster.
 
@@ -350,6 +380,7 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
 | 0b8e9be | Colour-symmetric tie-breaks | Hard suite, 420 games: blue 2.15 to 2.33 (red 2.57 to 2.44, code unchanged, noise). Blue vs exact copy 0.70 to 1.23; blue vs A\* 1.57 to 2.73. |
 | b655d2a | Route verification + dead-end trap | Paired, hard suite: +0.41 / +0.24 (verification alone +0.33 / +0.16, trap alone +0.10 / +0.19). Full suite +0.02 +- 0.06. A\* about -0.17 +- 0.13. |
 | 3188c01 | Multi-dot trips | +0.08 +- 0.09 / +0.24 +- 0.08; A\* +0.45 / +0.55; full suite +0.06 +- 0.05 |
+| PR #13 | Defender chase solver (`contain`, `holds`) | +0.69 (300 games vs crowded-stalls, 6 maps), +0.25 and +0.14 (8 rivals, 16 maps, 2 seed sets), +0.33 (320 fresh games vs crowded-stalls, 16 maps). Head to head vs crowded-stalls 1.51 to 1.85, vs v2 1.65 to 2.02. defaultCapture unchanged. |
 
 ### Latest numbers
 
@@ -357,6 +388,10 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
   two seed sets (about +0.5 a game). The other ten opponents are unchanged.
 - Wider reference suite (10 opponents, 16 maps, 2 seed sets, 640 games):
   2.40 points a game.
+- Round robin before the chase solver (`testing/tournament.py`, 23 agents,
+  16 maps, both colours, maps weighted equally, 8,096 games): this agent
+  2.54, v2 2.49, crowded-stalls 2.44, Cursor 2.02, every other agent 1.93
+  or less.
 
 ### Contest-team study
 
@@ -379,6 +414,8 @@ agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
 | crowded-stalls vs previous `ContestAgent` (defaultCapture) | 60 | 59-1-0 | 2.97 |
 | PR #5 agent vs v2 (defaultCapture) | 120 | 59-8-53 | 1.54 |
 | 0b8e9be agent as blue vs an exact copy of itself (was 0.70 before the tie-break fix) | not recorded | not recorded | 1.23 (even is 1.5) |
+| This agent vs crowded-stalls (16 maps, 10 seeds, both colours) | 320 | 191-18-111 | 1.85 (1.51 before the chase solver) |
+| This agent vs v2 (16 maps, 10 seeds, both colours) | 320 | 208-23-89 | 2.02 (1.65 before the chase solver) |
 
 ## 6. Tried and dropped
 
@@ -407,6 +444,12 @@ agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
 | Loss fix: walk-in | -0.09 | Lower; not kept |
 | Loss fix: clock | -0.03 | Lower; not kept |
 | Loss fix: scare | -0.06 | Lower; not kept |
+| Reset tracking to the spawn after a kill, plus a bigger load when both enemies are deep in our half | +0.07 / +0.10 on two 300-game sets, then -0.03 +- 0.02 replayed on 703 round-robin games | Noise |
+| Pin a hidden invader to a vanished dot; capsule exits; scared shadow on the exit path | -0.05 to +0.05, sign flips between seed sets | Noise |
+| Double cover near the enemy's quota | -0.11; mirror-attack -0.59 | Gives up too much attack |
+| Hold the nearest door we reach first when trailing a loaded invader | +0.07 +- 0.10 vs crowded-stalls; bloxCapture -0.60 / -0.96 | The raider eats freely while we hold a door it does not need |
+| Chase solver without the sight rule | +0.13 to +0.66, but defaultCapture -1.3 vs crowded-stalls and v2 | Holds from chokepoints out of sight, where the solution can no longer be followed |
+| Chase solver, holding only from squares within 4 of the invader | defaultCapture fixed vs crowded-stalls and v2, -1.0 vs Cursor and mirror-attack | The plan could still need an out-of-sight square later; the sight rule inside the solver replaced it |
 
 The four variants from the contest-team data were each paired over 640 games
 (10 opponents, 16 maps, 2 seed sets; reference 2.40). The open weakness
@@ -447,3 +490,6 @@ See `testing/README.md`. In short:
   of the hard suite and a run against the full opponent list shows no other
   loss. Treat differences under about 0.1 points a game as noise.
 - `match_stats.py` and `why.py` explain why a game was won or lost.
+- `check_contain.py` re-derives the defender's solved chase game from the
+  rules on chosen maps (`RANDOM<n>` works too). Run it after changing
+  `Maze.contain`.

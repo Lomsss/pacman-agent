@@ -13,6 +13,7 @@ from contest.game import Directions
 from contest.util import nearest_point
 
 INF = float("inf")
+SIGHT = 5  # the engine shows an enemy within this Manhattan distance of either of us
 STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
          (0, 1, Directions.NORTH), (0, -1, Directions.SOUTH))
 # Blue sees the map rotated by 180 degrees, so its first step to try is the
@@ -95,6 +96,54 @@ class Maze:
         for p, q in reversed(parents):
             mouth[p] = mouth.get(q, q)
         return mouth
+
+    def contain(self, capsules):
+        """Solve our ghost against one invader on our side as a two-player game.
+        lost[d * n + i] is set when, with the invader to move from i and our ghost
+        on d, the invader can force its way home, onto a capsule or out of our
+        ghost's sight (where we could no longer follow the solution) whatever we do."""
+        home = self.order(self.home)
+        self.cix = ix = {p: k for k, p in enumerate(home)}
+        n = len(home)
+        nbr = [[ix[q] for q, _ in self.edges[p] if q in ix] + [ix[p]] for p in home]
+        # A capsule is a goal even under our ghost: the engine eats it before checking the catch.
+        out = [any(q not in self.home for q, _ in self.edges[p]) for p in home]
+        caps = [[ix[q] for q, _ in self.edges[p] if q in capsules] for p in home]
+        lost = bytearray(n * n)
+        beaten = bytearray(n * n)
+        # Ghost replies not yet known to lose; a ghost that can step onto the invader never loses.
+        left = [n * n if i in nbr[d] else len(nbr[d]) for d in range(n) for i in range(n)]
+        queue = deque((0, d, i) for d in range(n) for i in range(n)
+                      if i != d and (out[i] or caps[i] or
+                                     any(manhattan(home[d], home[j]) > SIGHT for j in nbr[i])))
+        for _, d, i in queue:
+            lost[d * n + i] = 1
+        while queue:
+            ghost_turn, d, i = queue.popleft()
+            if not ghost_turn:
+                for e in nbr[d]:
+                    k = e * n + i
+                    if e != i and not beaten[k]:
+                        left[k] -= 1
+                        if not left[k]:
+                            beaten[k] = 1
+                            queue.append((1, e, i))
+            else:
+                for j in nbr[i]:
+                    k = d * n + j
+                    if j != d and not lost[k]:
+                        lost[k] = 1
+                        queue.append((0, d, j))
+        self.lost = lost
+
+    def holds(self, d, i):
+        """Our ghost's moves from d (staying included) after which an invader on i
+        can never get home: eating it, or any square the solved game keeps."""
+        ix, n = self.cix, len(self.cix)
+        if d not in ix or i not in ix:
+            return []
+        return [q for q in [q for q, _ in self.edges[d]] + [d]
+                if q in ix and (q == i or not self.lost[ix[q] * n + ix[i]])]
 
     def order(self, squares):
         return sorted(squares, key=self.key.__getitem__)
@@ -282,6 +331,8 @@ class CapturePlayer(CaptureAgent):
         self.enemies = self.get_opponents(state)
         self.maze = Maze(state.get_walls(), self.red)
         self.dist = self.maze.dist
+        # shortcut: capsules eaten later still count as invader goals, which only makes holding stricter.
+        self.maze.contain(set(self.get_capsules_you_are_defending(state)))
         self.defended = self.resources(state)
         self.quota = (len(self.get_food(state).as_list()) +
                       len(self.get_food_you_are_defending(state).as_list())) / 2 - 2
@@ -694,6 +745,14 @@ class CapturePlayer(CaptureAgent):
             i, inv, _ = min(sightings, key=priority)
             if costs[inv] <= 1 and state.get_agent_position(i) is not None:
                 return actions[inv]
+            seen = state.get_agent_position(i)
+            if seen is not None:
+                # Where the solved chase says it can never get home, stay there,
+                # as close to it as that allows; chasing from behind never closes.
+                at = nearest_point(seen)
+                hold = [q for q in maze.holds(p, at) if q in costs]
+                if hold:
+                    return actions[min(hold, key=lambda q: (self.dist(q, at), maze.key[q]))]
             # Shortest-path interception compares both agents' arrival times.
             # Intercept on a shortest corridor to likely loot or the exit.
             # Select the earliest square we reach no later than the invader.
