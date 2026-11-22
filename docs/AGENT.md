@@ -129,9 +129,10 @@ left (300 at the start).
 | `double_cover` | Two invaders, we are scared for 15 or less, and we are the sentinel, or we are a ghost while our mate is on the enemy side. A raider already across (a pacman) does not count, so it finishes its trip. |
 | `emergency` | `double_cover`, or we lead with fewer than 24 moves left. |
 | `visible_near` | A visible invader within 2 squares. |
-| `assist` | No invaders and (we are scared for more than 8, we trail, or fewer than 245 moves left and we do not lead); or scared for more than 15, whatever is invading. A long-scared ghost can neither eat nor block, and with both enemies on our side their half is empty. |
+| `assist` | No invaders and (we are scared for more than 8, we trail, or fewer than 150 moves left and we do not lead); or scared for more than 15, whatever is invading. A long-scared ghost can neither eat nor block, and with both enemies on our side their half is empty. |
 | defend | `(guarding and not assist) or emergency or visible_near`, and only while we are a ghost. |
-| `recall` | Passed to `raid` for a sentinel out raiding when an invader appears and we are scared for less than 5. `emergency` also recalls. |
+| `recall` | Passed to `raid` for a sentinel out raiding when an invader appears and we are scared for less than 5, unless a `sortie` runs. `emergency` also recalls. |
+| `sortie` | A frozen board (score, our dots and their dots unchanged for 50 turns while an invader is on our side or our mate is across) is a tie at best. A sentinel that is level or behind with more than 100 moves left then raids for 100 turns; only `emergency` brings it back. It ends early once we lead. |
 
 So the sentinel defends unless `assist` holds, and the raider defends only
 in emergencies or when a visible invader is within 2. A pacman never runs
@@ -149,7 +150,7 @@ a door-holding guard on defaultCapture. Food inside an enemy dead end gets
 mouth no more than one move after we get back out. With `lookahead`, forecast
 squares add `18 * probability`. Each repeat visit in `recent` adds 0.65.
 
-**When to bank.** `limit` is 3 when level or ahead, 5 when behind. With food
+**When to bank.** `limit` is 5 when level or ahead, 7 when behind. With food
 carried, `cash` is true if any of these hold:
 
 - what we returned plus what we carry reaches `quota` (half the total dots,
@@ -163,7 +164,7 @@ carried, `cash` is true if any of these hold:
 **Exit pricing.** While we are a pacman and a ghost with scared timer 3 or
 less is visible, each door costs `costs[b] + 3 * max(0, 2 - lead)`, where
 `lead` is how many moves sooner we reach it than the nearest such ghost.
-If we carry food and the lead at the chosen door is between -1 and 3, we
+If we carry food and the lead at the chosen door is 0 or 1, we
 bank now. A pacman that must bank (`cash`, `recall` or no food left) heads
 for that door through `safe_step`.
 
@@ -193,11 +194,34 @@ When ahead we keep the stand-off, because it runs the clock for us. With the
 double risk weights this was the PR #5 change: 2.52 to 2.80 points a game on
 defaultCapture.
 
+A longer loop (the last 3 to 20 squares of `trail`, the last 40, repeated
+twice with at least 3 distinct squares) means a ghost mirrors us along the
+border. When level or behind, empty-handed and with the goal flipping, `lock`
+commits to the current goal for its distance plus 2 turns.
+
+**Sortie.** `stall` counts raid turns spent empty-handed, with nothing
+eaten, while a visible ghost with scared timer 5 or less is within 6. At
+`STALL` (8), and unless recalled, `foray` looks for a one-dot out-and-back
+trip (one of the 20 nearest dots, home through one of its 3 nearest doors)
+that no enemy can cut off whatever it does: at every away square, at our
+arrival time, no enemy could already stand there (a ghost walks its own
+side, an invader may use ours; unseen enemies get 2 moves of slack, scared
+ghosts count only once their timer runs out). The plan is re-checked every
+move and dropped the moment the check fails or we are recalled.
+
+**Hunting.** A visible enemy ghost on its side within `HUNT` (2) steps,
+scared for more than `2 * distance + 1` moves, is eaten, unless the clock
+is down to `bank[p] + 12` moves. An eaten guard respawns at its start
+instead of waking up next to us when the fright ends.
+
 **Choosing.** If a lock is active, keep the locked goal. Otherwise take the
 cheapest price, then, while we are a pacman or within 1 of a door, ask
 `trips` for a better first stop. If `trips` returns nothing and a visible,
 unscared ghost is within 7, `verified` picks the target. A pacman's step
-always goes through `safe_step`.
+always goes through `safe_step`. A ghost that has spent 10 of its last 12
+turns within 2 of a door keeps its new target while the route to it keeps
+shortening (`commit`), so a guard's wiggle cannot flip it back from a long
+open crossing to the short blocked one.
 
 ### 2.5 `trips`: multi-dot trip planner
 
@@ -289,17 +313,25 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
    crowded-stalls 1.51 to 1.85, v2 1.65 to 2.02. defaultCapture is
    unchanged (0 of 144 games changed): there the holds the solver finds
    while keeping the invader in sight are rare.
-5. **Interception.** Otherwise assume its goal is the nearest door
+5. **Seal.** If that invader is visible and carries 2 or more, take a
+   square from which it reaches no door strictly before us (`pen`), and
+   from which every reply it makes still leaves us a next square that seals
+   it. Prefer squares that keep it in sight, then those that leave it the
+   fewest squares, then the closest. A ghost trailing a loaded invader
+   round a loop in our half never closes; this lost crowdedCapture by up to
+   40. Capsules are not exits in `pen`, so a sealed invader can still eat
+   our capsule (see "Tried and dropped").
+6. **Interception.** Otherwise assume its goal is the nearest door
    when it carries 2 or more, else our nearest food or capsule. With
    `lookahead`, the goal among these that best fits the forecast replies
    is used instead of the nearest. Go to the square on its shortest
    path to that goal, nearest to the invader, that we reach no later than it.
-6. **Door re-cover.** With no invaders and not scared: if an enemy was a
+7. **Door re-cover.** With no invaders and not scared: if an enemy was a
    pacman on one of our doors on our previous turn and is now visible one
    step from that door, go back to that door.
-7. **Bite chase.** With invaders, go to the last eaten square until 6 turns
+8. **Bite chase.** With invaders, go to the last eaten square until 6 turns
    after it vanished (`bite_age <= 6`).
-8. **Patrol.** Choose the door minimising mean distance to the 4 nearest
+9. **Patrol.** Choose the door minimising mean distance to the 4 nearest
    defended items, plus `0.8 *` the smallest `distance + 4 * (1 - w)` over
    enemy estimates on their side, plus `0.1 *` our route cost, plus `0.25 *`
    mean distance to all doors.
@@ -326,17 +358,22 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 | `SIGHT` | 5 | Engine sight range; `contain` counts an invader beyond it as escaped |
 | `recent`, `goal_hist` | 12, 4 | Memory lengths |
 | `quota` | total dots / 2 - 2 | Bank everything at this point |
-| Roles | 24, 2, 8, 245, 15, 5 | `emergency`, `visible_near`, `assist`, `recall` |
+| Roles | 24, 2, 8, 150, 15, 5 | `emergency`, `visible_near`, `assist`, `recall` |
+| Frozen board | 50 turns, raid for 100, more than 100 moves left | `sortie` |
 | Risk weights | 60, 38, 10, 2.8, 0.8 | Ghost at distance 0..4; ghosts scared > 5 ignored |
 | Dead-end danger | slack <= 1, `min(16, 3 + 2d)` | Food in enemy pockets |
 | Forecast risk | 18 | Per unit reply probability |
 | Revisit cost | 0.65 | Per repeat in `recent` |
-| `limit` | 3 / 5 | Carry limit when level or ahead / behind |
+| `limit` | 5 / 7 | Carry limit when level or ahead / behind |
 | Cash rules | +8, 2, +3, `limit + 2` | Clock, door cost, far food, full load |
-| Exit pricing | ghosts scared <= 3, `3 * max(0, 2 - lead)`, window -1..3 | Door choice and early bank |
+| Exit pricing | ghosts scared <= 3, `3 * max(0, 2 - lead)`, window 0..1 | Door choice and early bank |
 | `capsule_bonus` | 4 / 1 | Fewer than 5 dots or an enemy scared < 7 |
 | Price | 0.36 home, 1.5 goal, +4 mate, +12 taboo (radius 3) | `price`, `extra` |
-| Stand-off | taboo 20, lock 8 | Raid turns |
+| Stand-off | taboo 20, lock 8; loops of 3-20 in a 40-square `trail`, lock distance + 2; `commit` after 10 of 12 turns within 2 of a door | Raid turns |
+| `STALL` | 8 | Stalled turns before a `foray` |
+| `foray` | 20 dots, 3 doors, 2 moves slack for unseen enemies | Uncatchable one-dot trip |
+| `HUNT` | 2, timer > 2d + 1, clock > `bank[p] + 12` | Eat a scared guard |
+| Seal | carry >= 2, two-ply | `defend` step 5, `pen` |
 | Trip threat | scared <= 5 within 10 | Turns on `watch` |
 | Trip gate | pacman or `bank[p] <= 1` | When `trips` runs |
 | Verification | unscared within 7, 6 targets, 6 doors | `verified` |
@@ -357,7 +394,7 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
   work counters, so a seeded game against a deterministic opponent replays
   move for move (unless a 0.45 s clock check fires).
 - Time: measured on all 16 test maps in both colours, 4 games at a time:
-  slowest move 56 ms, setup at most 0.19 s (jumboCapture), about 1.1 s of
+  slowest move 70 ms, setup at most 0.2 s (jumboCapture), at most 1.3 s of
   thinking per game for both agents together. The engine's limits are 15 s
   for setup, a warning for a move over 1 s (the third warning loses), 3 s
   for an instant forfeit and 900 s per agent per game. The 0.45 s clock
@@ -381,6 +418,7 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
 | 0b8e9be | Colour-symmetric tie-breaks | Hard suite, 420 games: blue 2.15 to 2.33 (red 2.57 to 2.44, code unchanged, noise). Blue vs exact copy 0.70 to 1.23; blue vs A\* 1.57 to 2.73. |
 | b655d2a | Route verification + dead-end trap | Paired, hard suite: +0.41 / +0.24 (verification alone +0.33 / +0.16, trap alone +0.10 / +0.19). Full suite +0.02 +- 0.06. A\* about -0.17 +- 0.13. |
 | 3188c01 | Multi-dot trips | +0.08 +- 0.09 / +0.24 +- 0.08; A\* +0.45 / +0.55; full suite +0.06 +- 0.05 |
+| PR #15 | Seal against looping loaded invaders, sortie and loop lock against stand-offs, frozen-board sentinel raid, hunting scared guards, carry limit 5 / 7, assist under 150 moves, exit window 0..1 | Four ideas built and screened in parallel, each about +0.1 alone; together they add up. vs crowded-stalls and v2, 120 games each per seed set (30 fixed + 30 random maps, both colours), win rate against the PR #14 agent on three held-out seed sets: crowded-stalls 75.8 / 67.5 / 70.8% to 75.8 / 84.2 / 85.8% (mean 81.9%), v2 67.5 / 66.7 / 74.2% to 75.8 / 83.3 / 81.7% (mean 80.3%); training set 82.5% / 80.8%. Head to head vs PR #14 78-4-38 (120 games). mirror-attack 64% to 85%; astar, approxq, mm up; baseline, alma, ghostclaniol level. defaultCapture (40 games per opponent, 2 seed sets): bfs, Cursor and mirror-attack up by 0.65 to 1.1 points, v2 +0.40 / +0.20, crowded-stalls +0.15 / -0.23, the PR #5 agent -0.30 / +0.30, mdp -0.18 / -0.10. |
 | PR #14 | Long-scared guard raids even with invaders on our side; scared shadowing leans to the invader's exit | Paired, 120 games per opponent on 2 seed sets (30 fixed + 30 random maps, both colours): crowded-stalls +0.07 +- 0.08 and +0.24 +- 0.10 (win rate 63.8% to 69.2%), v2 +0.09 +- 0.09 and +0.13 +- 0.07 (61.3% to 64.2%), head to head vs the PR #13 agent +0.07 / +0.09, mirror-attack -0.07 / +0.00. baseline, mm, alma, ghostclaniol, approxq and astar unchanged (at most +0.01, 240 games each). The raid change carries the gain; the shadow tie-break alone was +0.00 to +0.03. |
 | PR #13 | Defender chase solver (`contain`, `holds`) | +0.69 (300 games vs crowded-stalls, 6 maps), +0.25 and +0.14 (8 rivals, 16 maps, 2 seed sets), +0.33 (320 fresh games vs crowded-stalls, 16 maps). Head to head vs crowded-stalls 1.51 to 1.85, vs v2 1.65 to 2.02. defaultCapture unchanged. |
 
@@ -395,6 +433,10 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
   2.54, v2 2.49, crowded-stalls 2.44, Cursor 2.02, every other agent 1.93
   or less.
 
+- PR #15 agent, three held-out seed sets (360 games per rival): 81.9% wins
+  vs crowded-stalls and 80.3% vs v2; per set 75.8 to 85.8%. On
+  defaultCapture alone: crowded-stalls 60.0 / 67.5% and v2 67.5 / 65.0%
+  (40 games each), so the contest map is still the hardest.
 - Against the PR #14 agent on 240 games each (both seed sets above):
   crowded-stalls 69.2% wins, v2 64.2%, mirror-attack 64.2%, baseline 99.2%,
   mm 88.8%, alma 98.8%, ghostclaniol 91.7%, approxq 92.1%, astar 81.7%.
@@ -455,6 +497,12 @@ agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
 | Pin a hidden invader to a vanished dot; capsule exits; scared shadow on the exit path | -0.05 to +0.05, sign flips between seed sets | Noise |
 | Double cover near the enemy's quota | -0.11; mirror-attack -0.59 | Gives up too much attack |
 | Hold the nearest door we reach first when trailing a loaded invader | +0.07 +- 0.10 vs crowded-stalls; bloxCapture -0.60 / -0.96 | The raider eats freely while we hold a door it does not need |
+| Sentinel crosses in mid-game when our raider is held at the line (pincer) | +0.11 on training, -0.16 to -0.30 on two held-out sets | Changes 40-55 of 120 games; leaving home costs as much as the second attacker gains |
+| Commit to a target the raider reaches before the guard (outrun lock) | +0.09 / +0.24 training, -0.16 / -0.23 held-out | Far more aggressive; fastCapture +1.0, office and distant collapse |
+| Raider blocks the exit a chased invader heads for (strict and loose) | -0.03 / +0.03; -0.01 / +0.03 | Harmless but rarely decisive |
+| Seal treats our capsules as exits | -0.04 vs both rivals on 8 comparisons | Fixes a capsule leak vs the baseline (1 game in 120) but gives up seals that hold vs the rivals |
+| Hunt reach 3 or 4; capsule hold; capsule break-out | Within noise or negative | Chasing fleeing ghosts wastes attack time |
+| Carry limit 4 / 6, assist under 290 moves | +0.07 / +0.12; noisy (36-48 games changed) | 5 / 7 and 150 kept |
 | Raider comes back to defend against a loaded invader (carry >= 5 within 8; with or without leaving a raid; with or without splitting exits) | -0.17 to -0.30 vs crowded-stalls, v2 and mirror-attack | A held, loaded invader keeps the raider home for hundreds of moves; any defending by the raider costs more attack than it saves |
 | Both ghosts squeeze a lone invader (joint step minimising the squares it reaches first) | -0.21 vs crowded-stalls, -0.27 head to head | Same: the raider's attack is worth more |
 | Wait at the invader's likeliest goal instead of trailing it | -0.44 to -0.52 vs every rival | Trailing keeps pressure on the invader |
