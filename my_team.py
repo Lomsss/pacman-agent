@@ -27,6 +27,10 @@ TRIP_EVALS, TRIP_STEPS = 600, 60000
 # The raider rarely banks right after a trip, so the return leg weighs what
 # the single-target price gives it; a one-stop trip then ranks as that price.
 TRIP_HOME = 0.36
+# Own moves face to face with a guard, empty-handed, before we look for a sortie it cannot stop.
+STALL = 8
+# Route steps to a scared enemy ghost we go out of our way to eat.
+HUNT = 2
 
 
 def create_team(first_index, second_index, is_red, first="Raider", second="Sentinel",
@@ -58,17 +62,7 @@ class Maze:
         # Repeat from each source and cache its distance row for move decisions.
         # On oversized boards keep only crossing rows and use Manhattan elsewhere.
         sources = self.edges if len(cells) <= 650 else self.doors[:32]
-        self.rows = {}
-        for source in sources:
-            row = {source: 0}
-            queue = deque([source])
-            while queue:
-                p = queue.popleft()
-                for q, _ in self.edges[p]:
-                    if q not in row:
-                        row[q] = row[p] + 1
-                        queue.append(q)
-            self.rows[source] = row
+        self.rows = {source: self.flood(source) for source in sources}
         self.bank = {p: min((self.dist(p, b) for b in self.doors), default=999) for p in cells}
         # Graph pruning by degree identifies dead ends and their escape mouths.
         # Peel leaves on the enemy side. A raider below a peeled cell must
@@ -77,6 +71,17 @@ class Maze:
         # Our own pockets trap invaders the same way: whoever holds the mouth
         # first keeps an invader below it from getting home.
         self.home_mouth = {p: m for p, m in self.peel(lambda p: p in self.home).items() if m in self.home}
+
+    def flood(self, source, allowed=None):
+        row = {source: 0}
+        queue = deque([source])
+        while queue:
+            p = queue.popleft()
+            for q, _ in self.edges[p]:
+                if q not in row and (allowed is None or allowed(q)):
+                    row[q] = row[p] + 1
+                    queue.append(q)
+        return row
 
     def peel(self, side):
         degree = {p: len(edges) for p, edges in self.edges.items()}
@@ -337,10 +342,14 @@ class CapturePlayer(CaptureAgent):
         self.quota = (len(self.get_food(state).as_list()) +
                       len(self.get_food_you_are_defending(state).as_list())) / 2 - 2
         self.recent = deque(maxlen=12)
+        self.trail = deque(maxlen=40)
         self.goal = None
         self.goal_hist = deque(maxlen=4)
         self.taboo = {}
         self.lock_goal, self.lock = None, 0
+        self.commit = None
+        self.stall, self.food_left, self.plan = 0, 0, None
+        self.frozen, self.sortie, self.board = 0, 0, None
         self.bite = None
         self.bite_age = 99
         self.models = {i: OpponentModel(self.maze, state.get_initial_agent_position(i))
@@ -386,6 +395,7 @@ class CapturePlayer(CaptureAgent):
         p = nearest_point(me.get_position())
         mate = nearest_point(state.get_agent_position(self.mate))
         self.recent.append(p)
+        self.trail.append(p)
         defended = self.resources(state)
         missing = self.defended - defended
         self.defended = defended
@@ -410,12 +420,23 @@ class CapturePlayer(CaptureAgent):
         # scared, while trailing, or when both opposing ghosts stay home.
         # Long scared, it raids whatever is invading: their half is emptier.
         assist = (not invaders and (me.scared_timer > 8 or score < 0 or
-                  (moves < 245 and score <= 0))) or me.scared_timer > 15
+                  (moves < 150 and score <= 0))) or me.scared_timer > 15
+        # A frozen board (nothing eaten or banked for 50 moves, everyone
+        # held in a stand-off) is a tie at best: the guard leaves its post to raid.
+        board = (score, len(defended), len(self.get_food(state).as_list()))
+        held = invaders or state.get_agent_state(self.mate).is_pacman
+        self.frozen = self.frozen + 1 if board == self.board and held else 0
+        self.board = board
+        self.sortie = max(0, self.sortie - 1) if score <= 0 else 0
+        if self.guarding and self.frozen >= 50 and score <= 0 and moves > 100:
+            self.sortie = 100
         defend = (self.guarding and not assist or emergency or visible_near) and not me.is_pacman
+        if self.sortie:
+            defend = emergency and not me.is_pacman
         if defend:
             action = self.defend(state, p, mate, invaders, estimates, legal)
         else:
-            recall = self.guarding and bool(invaders) and me.scared_timer < 5
+            recall = self.guarding and bool(invaders) and me.scared_timer < 5 and not self.sortie
             action = self.raid(state, p, mate, estimates, legal, moves, recall or emergency)
         return action if action in legal else legal[0]
 
@@ -424,6 +445,28 @@ class CapturePlayer(CaptureAgent):
         me = state.get_agent_state(self.index)
         carried = me.num_carrying
         food = maze.order(self.get_food(state).as_list())
+        ghosts = [(nearest_point(state.get_agent_position(i)), state.get_agent_state(i).scared_timer)
+                  for i in self.enemies if state.get_agent_position(i) is not None
+                  and not state.get_agent_state(i).is_pacman]
+        # Own moves spent empty-handed without a bite, face to face with an awake guard.
+        guard = any(scared <= 5 and self.dist(p, g) <= 6 for g, scared in ghosts)
+        self.stall = self.stall + 1 if not carried and guard and len(food) == self.food_left else 0
+        self.food_left = len(food)
+        if self.plan and p in self.plan:
+            self.plan = self.plan[self.plan.index(p):]
+        else:
+            self.plan = None
+        start = self.plan is None and self.stall >= STALL and not recall
+        rows = self.threats(estimates, state) if (self.plan and not recall) or start else None
+        if start:
+            self.plan = self.foray(p, food, rows)
+        # Called home (recall or emergency), a trip under way is dropped too.
+        if not recall and self.plan and len(self.plan) > 1 and self.unreachable(self.plan, 0, rows):
+            step = next(a for q, a in maze.edges[p] if q == self.plan[1])
+            if step in legal:
+                self.stall = 0
+                return step
+        self.plan = None
         capsules = set(self.get_capsules(state))
         # A visible defender contests adjacent squares on its next turn.
         # A capsule is consumed before collision testing, so it is a safe step.
@@ -463,7 +506,7 @@ class CapturePlayer(CaptureAgent):
         bank = min(doors, key=costs.get)
         score = self.get_score(state)
         returned = sum(state.get_agent_state(i).num_returned for i in self.agentsOnTeam)
-        limit = 3 if score >= 0 else 5
+        limit = 5 if score >= 0 else 7
         near_food = min((self.dist(p, q) for q in food), default=999)
         full_load = carried >= limit and (near_food > 1 or carried >= limit + 2)
         cash = carried and (
@@ -484,8 +527,15 @@ class CapturePlayer(CaptureAgent):
                 return costs[b] + 3 * max(0, 2 - lead)
             bank = min(doors, key=exit_price)
             window = min(self.dist(g, bank) for g in active) - self.dist(p, bank)
-            if carried and - 1 <= window <= 3:
+            if carried and 0 <= window <= 1:
                 cash = True
+        # A scared guard within reach goes back to its start if we eat it,
+        # instead of waking up next to us when the fright ends.
+        prey = [g for g, scared in ghosts if scared > 2 * self.dist(p, g) + 1 and
+                g in costs and g not in maze.home and self.dist(p, g) <= HUNT]
+        if prey and moves > maze.bank[p] + 12:
+            self.goal = min(prey, key=costs.get)
+            return actions[self.goal]
         if me.is_pacman and (cash or recall or not food):
             self.goal = bank
             return self.safe_step(p, actions[bank], active, capsules, legal)
@@ -502,6 +552,11 @@ class CapturePlayer(CaptureAgent):
         recent = list(self.recent)
         cycling = (len(recent) >= 6 and recent[-1] == recent[-3] == recent[-5]
                    and recent[-2] == recent[-4] and recent[-1] != recent[-2])
+        # A ghost mirroring us along the border makes longer loops; commit
+        # to the far target long enough to reach it instead of turning back.
+        trail = list(self.trail)
+        loop = next((k for k in range(3, 21) if len(trail) >= 2 * k and
+                     trail[-k:] == trail[-2 * k:-k] and len(set(trail[-k:])) > 2), 0)
         for q in list(self.taboo):
             self.taboo[q] -= 1
             if self.taboo[q] <= 0:
@@ -513,6 +568,8 @@ class CapturePlayer(CaptureAgent):
                 self.lock = 0
             else:
                 self.lock_goal, self.lock = self.goal, 8
+        elif loop and self.goal is not None and score <= 0 and not carried and len(set(self.goal_hist)) > 1:
+            self.lock_goal, self.lock = self.goal, self.dist(p, self.goal) + 2
 
         # Greedy evaluation ranks reachable goals by path cost and weighted features.
         def extra(q):
@@ -535,9 +592,6 @@ class CapturePlayer(CaptureAgent):
         else:
             self.lock = 0
             choice = min(candidates, key=price)
-            ghosts = [(nearest_point(state.get_agent_position(i)), state.get_agent_state(i).scared_timer)
-                      for i in self.enemies if state.get_agent_position(i) is not None
-                      and not state.get_agent_state(i).is_pacman]
             # A ghost whose fright ends within the risk horizon is already a threat.
             threat = any(scared <= 5 and self.dist(p, g) <= 10 for g, scared in ghosts)
             if me.is_pacman or maze.bank[p] <= 1:
@@ -555,11 +609,62 @@ class CapturePlayer(CaptureAgent):
                 elif any(scared == 0 and self.dist(p, g) <= 7 for g, scared in ghosts):
                     choice = self.verified(candidates, price, parent, costs, doors, capsules,
                                            [({g}, scared) for g, scared in ghosts], carried, choice)
+            # A raider stalled at the line keeps a new target while its route
+            # shortens as walked, so a guard's wiggle there cannot flip it
+            # back from a long open crossing to the short blocked one.
+            kept = self.commit and self.commit[0] in candidates and costs[self.commit[0]] <= self.commit[1] + 2
+            stalled = len(self.recent) == self.recent.maxlen and sum(maze.bank[q] <= 2 for q in self.recent) >= 10
+            if me.is_pacman or not (kept or stalled):
+                self.commit = None
+            else:
+                choice = self.commit[0] if kept else choice
+                self.commit = (choice, costs[choice] - 1 if kept else costs[choice])
             self.goal = choice
         self.goal_hist.append(self.goal)
         if me.is_pacman:
             return self.safe_step(p, actions[self.goal], active, capsules, legal)
         return actions[self.goal]
+
+    def threats(self, estimates, state):
+        """Per enemy: (distance row from its likeliest square, extra slack when unseen, scared timer).
+        A ghost walks its own side; an invader may come back through ours."""
+        rows = []
+        for i in self.enemies:
+            enemy = state.get_agent_state(i)
+            if not estimates[i]:
+                return None
+            g = max(estimates[i], key=lambda e: e[1])[0]
+            row = self.maze.flood(g, None if enemy.is_pacman else lambda n: n not in self.maze.home)
+            rows.append((row, 0 if state.get_agent_position(i) is not None else 2, enemy.scared_timer))
+        return rows
+
+    def unreachable(self, path, t0, rows):
+        # Worst case: no enemy can stand on an away square of ours by the move after we enter it.
+        if rows is None:
+            return False
+        for t, q in enumerate(path[1:], t0 + 1):
+            if q not in self.maze.home and any(t > scared and row.get(q, 999) <= t + slack
+                                               for row, slack, scared in rows):
+                return False
+        return True
+
+    def foray(self, p, food, rows):
+        """Shortest out-and-back trip to one dot that no guard can cut off whatever it does, or None."""
+        maze = self.maze
+        if rows is None:
+            return None
+        best = None
+        for f in sorted(food, key=lambda f: (self.dist(p, f), maze.key[f]))[:20]:
+            out = maze.descent(p, f)
+            if out is None or (best and len(out) >= len(best)) or not self.unreachable(out, 0, rows):
+                continue
+            for b in sorted(maze.doors, key=lambda b: (self.dist(f, b), maze.key[b]))[:TRIP_DOORS]:
+                back = maze.descent(f, b)
+                if back and self.unreachable(back, len(out) - 1, rows):
+                    if best is None or len(out) + len(back) - 1 < len(best):
+                        best = out + back[1:]
+                    break
+        return best
 
     def trips(self, p, ranked, costs, parent, extra, capsules, ghosts, hidden, carried, limit, threatened):
         """Best first stop of a short multi-dot trip, or None. A trip visits up
@@ -759,6 +864,29 @@ class CapturePlayer(CaptureAgent):
                 hold = [q for q in maze.holds(p, at) if q in costs]
                 if hold:
                     return actions[min(hold, key=lambda q: (self.dist(q, at), maze.key[q]))]
+                if state.get_agent_state(i).num_carrying >= 2:
+                    # A loaded invader on a loop just runs round it from a trailing
+                    # ghost. Instead take a square from which no door is left that
+                    # it reaches strictly before us.
+                    rows, pens = {}, {}
+
+                    def pen(r, q):
+                        if (r, q) not in pens:
+                            pens[r, q] = self.pen(r, q, rows)
+                        return pens[r, q]
+
+                    def steps(q):
+                        return [q] + [n for n, _ in maze.edges[q] if n in maze.home]
+                    # Sealed for one move is not enough: every reply of the invader
+                    # must leave us a next square that still seals it.
+                    sealed = [q for q, a in [(p, Directions.STOP)] + maze.edges[p]
+                              if q in costs and a in legal and pen(inv, q) is not None and
+                              all(any(pen(r, n) is not None for n in steps(q)) for r in steps(inv) if r != q)]
+                    if sealed:
+                        # Keep it in sight, or we lose the seal; then squeeze: leave it
+                        # the fewest squares it reaches first, then close in.
+                        return actions[min(sealed, key=lambda q: (manhattan(q, inv) >= SIGHT, pen(inv, q),
+                                                                  self.dist(q, inv), maze.key[q]))]
             # Shortest-path interception compares both agents' arrival times.
             # Intercept on a shortest corridor to likely loot or the exit.
             # Select the earliest square we reach no later than the invader.
@@ -801,6 +929,26 @@ class CapturePlayer(CaptureAgent):
             return (sum(loot) / max(1, len(loot)) + 0.8 * entry + 0.1 * costs[b] +
                     0.25 * sum(self.dist(b, gate) for gate in doors) / len(doors))
         return actions[min(doors, key=coverage)]
+
+    def pen(self, inv, guard, rows):
+        # How many squares the invader reaches strictly before our guard,
+        # or None when a door is among them.
+        maze = self.maze
+        # Oversized boards keep no row for most squares; Manhattan would flatter us.
+        if guard not in rows:
+            rows[guard] = maze.rows.get(guard) or maze.flood(guard)
+        row = rows[guard]
+        reach = {inv: 0}
+        queue = deque([inv])
+        while queue:
+            s = queue.popleft()
+            if s in maze.doors:
+                return None
+            for n, _ in maze.edges[s]:
+                if n in maze.home and n not in reach and reach[s] + 1 < row.get(n, 999):
+                    reach[n] = reach[s] + 1
+                    queue.append(n)
+        return len(reach)
 
 
 class Raider(CapturePlayer):
