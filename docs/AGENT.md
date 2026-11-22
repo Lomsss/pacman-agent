@@ -126,10 +126,10 @@ left (300 at the start).
 
 | Flag | Rule |
 |---|---|
-| `double_cover` | Two invaders, and we are the sentinel, or we are a ghost while our mate is on the enemy side. A raider already across (a pacman) does not count, so it finishes its trip. |
+| `double_cover` | Two invaders, we are scared for 15 or less, and we are the sentinel, or we are a ghost while our mate is on the enemy side. A raider already across (a pacman) does not count, so it finishes its trip. |
 | `emergency` | `double_cover`, or we lead with fewer than 24 moves left. |
 | `visible_near` | A visible invader within 2 squares. |
-| `assist` | No invaders and (we are scared for more than 8, we trail, or fewer than 245 moves left and we do not lead); or scared for more than 15 with one invader. |
+| `assist` | No invaders and (we are scared for more than 8, we trail, or fewer than 245 moves left and we do not lead); or scared for more than 15, whatever is invading. A long-scared ghost can neither eat nor block, and with both enemies on our side their half is empty. |
 | defend | `(guarding and not assist) or emergency or visible_near`, and only while we are a ghost. |
 | `recall` | Passed to `raid` for a sentinel out raiding when an invader appears and we are scared for less than 5. `emergency` also recalls. |
 
@@ -267,7 +267,8 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 
 1. **Scared shadowing.** While scared and an invader is tracked, stay about
    3 squares from it: score `max(0, 3 - near) * 10 + abs(near - 3)`, then
-   prefer squares near a door.
+   prefer squares near the door closest to the nearest invader, then near
+   any door.
 2. **Dead-end trap.** For each visible invader inside one of our pockets, if
    we reach its `home_mouth` no later than it does, hold the mouth (stop on
    it). Mouths with our capsule below them are skipped, since the capsule
@@ -380,6 +381,7 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
 | 0b8e9be | Colour-symmetric tie-breaks | Hard suite, 420 games: blue 2.15 to 2.33 (red 2.57 to 2.44, code unchanged, noise). Blue vs exact copy 0.70 to 1.23; blue vs A\* 1.57 to 2.73. |
 | b655d2a | Route verification + dead-end trap | Paired, hard suite: +0.41 / +0.24 (verification alone +0.33 / +0.16, trap alone +0.10 / +0.19). Full suite +0.02 +- 0.06. A\* about -0.17 +- 0.13. |
 | 3188c01 | Multi-dot trips | +0.08 +- 0.09 / +0.24 +- 0.08; A\* +0.45 / +0.55; full suite +0.06 +- 0.05 |
+| PR #14 | Long-scared guard raids even with invaders on our side; scared shadowing leans to the invader's exit | Paired, 120 games per opponent on 2 seed sets (30 fixed + 30 random maps, both colours): crowded-stalls +0.07 +- 0.08 and +0.24 +- 0.10 (win rate 63.8% to 69.2%), v2 +0.09 +- 0.09 and +0.13 +- 0.07 (61.3% to 64.2%), head to head vs the PR #13 agent +0.07 / +0.09, mirror-attack -0.07 / +0.00. baseline, mm, alma, ghostclaniol, approxq and astar unchanged (at most +0.01, 240 games each). The raid change carries the gain; the shadow tie-break alone was +0.00 to +0.03. |
 | PR #13 | Defender chase solver (`contain`, `holds`) | +0.69 (300 games vs crowded-stalls, 6 maps), +0.25 and +0.14 (8 rivals, 16 maps, 2 seed sets), +0.33 (320 fresh games vs crowded-stalls, 16 maps). Head to head vs crowded-stalls 1.51 to 1.85, vs v2 1.65 to 2.02. defaultCapture unchanged. |
 
 ### Latest numbers
@@ -392,6 +394,11 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
   16 maps, both colours, maps weighted equally, 8,096 games): this agent
   2.54, v2 2.49, crowded-stalls 2.44, Cursor 2.02, every other agent 1.93
   or less.
+
+- Against the PR #14 agent on 240 games each (both seed sets above):
+  crowded-stalls 69.2% wins, v2 64.2%, mirror-attack 64.2%, baseline 99.2%,
+  mm 88.8%, alma 98.8%, ghostclaniol 91.7%, approxq 92.1%, astar 81.7%.
+  Food lost per game to crowded-stalls and v2 is about 14 either way.
 
 ### Contest-team study
 
@@ -448,6 +455,15 @@ agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
 | Pin a hidden invader to a vanished dot; capsule exits; scared shadow on the exit path | -0.05 to +0.05, sign flips between seed sets | Noise |
 | Double cover near the enemy's quota | -0.11; mirror-attack -0.59 | Gives up too much attack |
 | Hold the nearest door we reach first when trailing a loaded invader | +0.07 +- 0.10 vs crowded-stalls; bloxCapture -0.60 / -0.96 | The raider eats freely while we hold a door it does not need |
+| Raider comes back to defend against a loaded invader (carry >= 5 within 8; with or without leaving a raid; with or without splitting exits) | -0.17 to -0.30 vs crowded-stalls, v2 and mirror-attack | A held, loaded invader keeps the raider home for hundreds of moves; any defending by the raider costs more attack than it saves |
+| Both ghosts squeeze a lone invader (joint step minimising the squares it reaches first) | -0.21 vs crowded-stalls, -0.27 head to head | Same: the raider's attack is worth more |
+| Wait at the invader's likeliest goal instead of trailing it | -0.44 to -0.52 vs every rival | Trailing keeps pressure on the invader |
+| Walk into a capsule-free dead end to eat a trapped invader | -0.03 to +0.00 | Works in replays, but a trapped invader also ties up one of theirs |
+| Re-solve the chase game after a capsule is eaten | -0.03 to +0.03 | Rarely changes a hold |
+| Patrol weighted toward our capsules | +0.01 +- 0.06 (500 games vs crowded-stalls) | Near-border capsules are lost to the first approach anyway |
+| Stall breaker (shun food near a ghost that blocked us for 20 moves) | +0.09 / -0.01 on two seed sets | Breaks 0-0 deadlocks, but the opened game goes either way |
+| Capsule break-out while cashing, bank before a fright ends | +0.12 / -0.18; +0.04 / -0.05 | Sign flips between opponents |
+| Raider keeps raiding against two invaders; idle guard joins a feast | Within +-0.02 of PR #14 | Rarely fires |
 | Chase solver without the sight rule | +0.13 to +0.66, but defaultCapture -1.3 vs crowded-stalls and v2 | Holds from chokepoints out of sight, where the solution can no longer be followed |
 | Chase solver, holding only from squares within 4 of the invader | defaultCapture fixed vs crowded-stalls and v2, -1.0 vs Cursor and mirror-attack | The plan could still need an out-of-sight square later; the sight rule inside the solver replaced it |
 

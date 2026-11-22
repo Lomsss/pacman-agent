@@ -399,16 +399,18 @@ class CapturePlayer(CaptureAgent):
         moves = (state.data.timeleft + 3) // 4
         # Two invaders leave the far side open. Let a raider already across
         # finish the trip if our sentinel is home; otherwise double-cover.
+        # A long-scared ghost can neither eat nor block, so it never covers.
         # A rule-based policy switches between raiding and defending.
-        double_cover = len(invaders) == 2 and (self.guarding or
+        double_cover = len(invaders) == 2 and me.scared_timer <= 15 and (self.guarding or
                        (not me.is_pacman and mate not in self.maze.home))
         emergency = double_cover or score > 0 and moves < 24
         visible_near = any(state.get_agent_position(i) is not None and
                            self.dist(p, nearest_point(state.get_agent_position(i))) <= 2 for i in invaders)
         # The raider backs up a busy guard. An idle guard can raid while
         # scared, while trailing, or when both opposing ghosts stay home.
+        # Long scared, it raids whatever is invading: their half is emptier.
         assist = (not invaders and (me.scared_timer > 8 or score < 0 or
-                  (moves < 245 and score <= 0))) or (me.scared_timer > 15 and len(invaders) == 1)
+                  (moves < 245 and score <= 0))) or me.scared_timer > 15
         defend = (self.guarding and not assist or emergency or visible_near) and not me.is_pacman
         if defend:
             action = self.defend(state, p, mate, invaders, estimates, legal)
@@ -703,10 +705,14 @@ class CapturePlayer(CaptureAgent):
         me = state.get_agent_state(self.index)
         sightings = [(i, q, w) for i in invaders for q, w in estimates[i] if q in costs]
         if me.scared_timer and sightings:
-            # Shadow outside one-reply capture range until the timer expires.
+            # Shadow outside one-reply capture range until the timer expires,
+            # on the side of the nearest invader's way home.
+            _, seen, _ = min(sightings, key=lambda s: costs[s[1]])
+            exit_ = min(maze.order(maze.doors), key=lambda b: self.dist(seen, b))
+
             def shadow(q):
                 near = min(self.dist(q, s) for _, s, _ in sightings)
-                return (max(0, 3 - near) * 10 + abs(near - 3), maze.bank[q])
+                return (max(0, 3 - near) * 10 + abs(near - 3), self.dist(q, exit_), maze.bank[q])
             choices = [(p, Directions.STOP)] + maze.edges[p]
             return min(((q, a) for q, a in choices if q in costs and a in legal),
                        key=lambda item: shadow(item[0]))[1]
