@@ -150,8 +150,9 @@ a door-holding guard on defaultCapture. Food inside an enemy dead end gets
 mouth no more than one move after we get back out. With `lookahead`, forecast
 squares add `18 * probability`. Each repeat visit in `recent` adds 0.65.
 
-**When to bank.** `limit` is 5 when level or ahead, 7 when behind. With food
-carried, `cash` is true if any of these hold:
+**When to bank.** `limit` is 5 when level or ahead, 7 when behind, and 99
+(no cap) while both enemies are pacmen: their half then has no defender, so
+only the trip checks below end a trip. With food carried, `cash` is true if any of these hold:
 
 - what we returned plus what we carry reaches `quota` (half the total dots,
   minus 2);
@@ -249,6 +250,8 @@ Safety checks replay `survive` along the trip:
   scores only if every tracked replay survives. With no belief for some
   hidden defender (`blind`, e.g. `prediction=0`), trips over the limit are
   dropped (neither scored nor extended).
+  With both enemies on our side (`limit` 99) it never applies: an invader
+  must first cross back before it can defend again, and `watch` still sees it.
 - `back` tries the `TRIP_DOORS` (3) nearest doors and uses the first one all
   active replays survive. If none does, the trip does not score. With no
   active replay it uses `bank[q]`.
@@ -364,7 +367,7 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 | Dead-end danger | slack <= 1, `min(16, 3 + 2d)` | Food in enemy pockets |
 | Forecast risk | 18 | Per unit reply probability |
 | Revisit cost | 0.65 | Per repeat in `recent` |
-| `limit` | 5 / 7 | Carry limit when level or ahead / behind |
+| `limit` | 5 / 7 / 99 | Carry limit when level or ahead / behind / both enemies are pacmen |
 | Cash rules | +8, 2, +3, `limit + 2` | Clock, door cost, far food, full load |
 | Exit pricing | ghosts scared <= 3, `3 * max(0, 2 - lead)`, window 0..1 | Door choice and early bank |
 | `capsule_bonus` | 4 / 1 | Fewer than 5 dots or an enemy scared < 7 |
@@ -418,6 +421,7 @@ opponents that do not lose every game on defaultCapture: `astar`, `bfs`,
 | 0b8e9be | Colour-symmetric tie-breaks | Hard suite, 420 games: blue 2.15 to 2.33 (red 2.57 to 2.44, code unchanged, noise). Blue vs exact copy 0.70 to 1.23; blue vs A\* 1.57 to 2.73. |
 | b655d2a | Route verification + dead-end trap | Paired, hard suite: +0.41 / +0.24 (verification alone +0.33 / +0.16, trap alone +0.10 / +0.19). Full suite +0.02 +- 0.06. A\* about -0.17 +- 0.13. |
 | 3188c01 | Multi-dot trips | +0.08 +- 0.09 / +0.24 +- 0.08; A\* +0.45 / +0.55; full suite +0.06 +- 0.05 |
+| PR #16 | No carry cap while both enemies are pacmen | PR #15 suite against the PR #15 agent, paired: rivals (crowded-stalls, v2; 240 games per seed set) +0.09 / +0.00 / +0.04 / +0.16 on four seed sets; win rate vs crowded-stalls 76.9% to 78.8%, v2 79.8% to 82.1% (mean of four sets). 12 other opponents (1,440 games) +0.02 +- 0.02, none lower; Out of Scope proxy +0.10. Head to head vs the PR #15 agent level (50-4-66 either way, as for a mirror). defaultCapture (360 games, 2 seed sets) -0.01 / +0.00. Earlier screen: +0.02 / +0.04 / +0.04 on three 1,298-game sets (11 opponents, 59 maps). |
 | PR #15 | Seal against looping loaded invaders, sortie and loop lock against stand-offs, frozen-board sentinel raid, hunting scared guards, carry limit 5 / 7, assist under 150 moves, exit window 0..1 | Four ideas built and screened in parallel, each about +0.1 alone; together they add up. vs crowded-stalls and v2, 120 games each per seed set (30 fixed + 30 random maps, both colours), win rate against the PR #14 agent on three held-out seed sets: crowded-stalls 75.8 / 67.5 / 70.8% to 75.8 / 84.2 / 85.8% (mean 81.9%), v2 67.5 / 66.7 / 74.2% to 75.8 / 83.3 / 81.7% (mean 80.3%); training set 82.5% / 80.8%. Head to head vs PR #14 78-4-38 (120 games). mirror-attack 64% to 85%; astar, approxq, mm up; baseline, alma, ghostclaniol level. defaultCapture (40 games per opponent, 2 seed sets): bfs, Cursor and mirror-attack up by 0.65 to 1.1 points, v2 +0.40 / +0.20, crowded-stalls +0.15 / -0.23, the PR #5 agent -0.30 / +0.30, mdp -0.18 / -0.10. |
 | PR #14 | Long-scared guard raids even with invaders on our side; scared shadowing leans to the invader's exit | Paired, 120 games per opponent on 2 seed sets (30 fixed + 30 random maps, both colours): crowded-stalls +0.07 +- 0.08 and +0.24 +- 0.10 (win rate 63.8% to 69.2%), v2 +0.09 +- 0.09 and +0.13 +- 0.07 (61.3% to 64.2%), head to head vs the PR #13 agent +0.07 / +0.09, mirror-attack -0.07 / +0.00. baseline, mm, alma, ghostclaniol, approxq and astar unchanged (at most +0.01, 240 games each). The raid change carries the gain; the shadow tie-break alone was +0.00 to +0.03. |
 | PR #13 | Defender chase solver (`contain`, `holds`) | +0.69 (300 games vs crowded-stalls, 6 maps), +0.25 and +0.14 (8 rivals, 16 maps, 2 seed sets), +0.33 (320 fresh games vs crowded-stalls, 16 maps). Head to head vs crowded-stalls 1.51 to 1.85, vs v2 1.65 to 2.02. defaultCapture unchanged. |
@@ -501,6 +505,11 @@ agent scored best overall: 2.83 points a game (105-2-5 over 112 games), and
 | Commit to a target the raider reaches before the guard (outrun lock) | +0.09 / +0.24 training, -0.16 / -0.23 held-out | Far more aggressive; fastCapture +1.0, office and distant collapse |
 | Raider blocks the exit a chased invader heads for (strict and loose) | -0.03 / +0.03; -0.01 / +0.03 | Harmless but rarely decisive |
 | Seal treats our capsules as exits | -0.04 vs both rivals on 8 comparisons | Fixes a capsule leak vs the baseline (1 game in 120) but gives up seals that hold vs the rivals |
+| Counter-raid: both agents raid when two invaders come (always, only while they carry 4 or less, only when not behind) | -0.15 to -0.27 | Leaves our half open; the raider's points are worth more than a second defender |
+| Guard-lock fixes: release a long hold when the other invader carries 5 more, deprioritise an empty-handed invader, raider covers a loaded second invader | -0.01 to +0.01 | Rarely fires |
+| Bait or pincer against a two-defender wall while behind (target spreading, risk x0.25 or x0) | +0.00 on 2,600 games; x0 worse vs a wall | Behind-mode already sends both agents |
+| Guard raids while all enemy ghosts are scared; both raid the first 30 / 60 moves | -0.01 to +0.01; -0.02 to +0.01 | Neutral |
+| Extra carry (+4) with one invader | +0.03 / -0.04 / +0.02 over carry +12 with two | Sign flips |
 | Hunt reach 3 or 4; capsule hold; capsule break-out | Within noise or negative | Chasing fleeing ghosts wastes attack time |
 | Carry limit 4 / 6, assist under 290 moves | +0.07 / +0.12; noisy (36-48 games changed) | 5 / 7 and 150 kept |
 | Raider comes back to defend against a loaded invader (carry >= 5 within 8; with or without leaving a raid; with or without splitting exits) | -0.17 to -0.30 vs crowded-stalls, v2 and mirror-attack | A held, loaded invader keeps the raider home for hundreds of moves; any defending by the raider costs more attack than it saves |

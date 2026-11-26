@@ -507,6 +507,9 @@ class CapturePlayer(CaptureAgent):
         score = self.get_score(state)
         returned = sum(state.get_agent_state(i).num_returned for i in self.agentsOnTeam)
         limit = 5 if score >= 0 else 7
+        # Both enemies invading leave their half unguarded: no carry cap, the trip checks still keep us safe.
+        if all(state.get_agent_state(i).is_pacman for i in self.enemies):
+            limit = 99
         near_food = min((self.dist(p, q) for q in food), default=999)
         full_load = carried >= limit and (near_food > 1 or carried >= limit + 2)
         cash = carried and (
