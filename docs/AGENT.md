@@ -133,6 +133,7 @@ left (300 at the start).
 | defend | `(guarding and not assist) or emergency or visible_near`, and only while we are a ghost. |
 | `recall` | Passed to `raid` for a sentinel out raiding when an invader appears and we are scared for less than 5, unless a `sortie` runs. `emergency` also recalls. |
 | `sortie` | A frozen board (score, our dots and their dots unchanged for 50 turns while an invader is on our side or our mate is across) is a tie at best. A sentinel that is level or behind with more than 100 moves left then raids for 100 turns; only `emergency` brings it back. It ends early once we lead. |
+| penned | A pacman that is behind, with its last 40 squares on 3 or fewer and a guard visible, walks into the nearest guard. A leader that walls our pacmen into a pocket wins by waiting (2Pac did it for 480 moves); respawning is the only way out. Runs before every other rule. |
 
 So the sentinel defends unless `assist` holds, and the raider defends only
 in emergencies or when a visible invader is within 2. A pacman never runs
@@ -150,9 +151,10 @@ a door-holding guard on defaultCapture. Food inside an enemy dead end gets
 mouth no more than one move after we get back out. With `lookahead`, forecast
 squares add `18 * probability`. Each repeat visit in `recent` adds 0.65.
 
-**When to bank.** `limit` is 5 when level or ahead, 7 when behind, and 99
-(no cap) while both enemies are pacmen: their half then has no defender, so
-only the trip checks below end a trip. With food carried, `cash` is true if any of these hold:
+**When to bank.** `limit` is 5 when level or ahead, 7 when behind, and 16
+while both enemies are pacmen: their half then has no defender. Uncapped (99)
+the raider hoarded 20+ dots and was penned in once a guard came back (2Pac
+proxy, 82 tournament maps). With food carried, `cash` is true if any of these hold:
 
 - what we returned plus what we carry reaches `quota` (half the total dots,
   minus 2);
@@ -180,7 +182,9 @@ extra(q) = danger[q] + 12 if within 3 of a taboo square
 
 `capsule_bonus` is 4 when fewer than 5 dots are left or some tracked enemy
 has scared timer below 7 (in practice almost always), otherwise 1. The 1.5
-bonus keeps the current goal unless another is clearly better.
+bonus keeps the current goal unless another is clearly better. A capsule
+pays +20 while every enemy is scared for more than 10: eating it then only
+wastes its fright (against 2Pac both our agents ate their capsules 2 moves apart).
 
 **Stand-off breaking.** `cycling` means the last five squares alternate
 A-B-A-B-A. When cycling, with a goal and the score level or behind:
@@ -250,7 +254,7 @@ Safety checks replay `survive` along the trip:
   scores only if every tracked replay survives. With no belief for some
   hidden defender (`blind`, e.g. `prediction=0`), trips over the limit are
   dropped (neither scored nor extended).
-  With both enemies on our side (`limit` 99) it never applies: an invader
+  With both enemies on our side (`limit` 16) it rarely applies: an invader
   must first cross back before it can defend again, and `watch` still sees it.
 - `back` tries the `TRIP_DOORS` (3) nearest doors and uses the first one all
   active replays survive. If none does, the trip does not score. With no
@@ -367,7 +371,7 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 | Dead-end danger | slack <= 1, `min(16, 3 + 2d)` | Food in enemy pockets |
 | Forecast risk | 18 | Per unit reply probability |
 | Revisit cost | 0.65 | Per repeat in `recent` |
-| `limit` | 5 / 7 / 99 | Carry limit when level or ahead / behind / both enemies are pacmen |
+| `limit` | 5 / 7 / 16 | Carry limit when level or ahead / behind / both enemies are pacmen |
 | Cash rules | +8, 2, +3, `limit + 2` | Clock, door cost, far food, full load |
 | Exit pricing | ghosts scared <= 3, `3 * max(0, 2 - lead)`, window 0..1 | Door choice and early bank |
 | `capsule_bonus` | 4 / 1 | Fewer than 5 dots or an enemy scared < 7 |

@@ -430,6 +430,13 @@ class CapturePlayer(CaptureAgent):
         self.sortie = max(0, self.sortie - 1) if score <= 0 else 0
         if self.guarding and self.frozen >= 50 and score <= 0 and moves > 100:
             self.sortie = 100
+        # Penned in on their side while behind (40 moves on 3 squares or fewer):
+        # the stand-off is a sure loss, so walk into the guard and respawn.
+        guards = [nearest_point(state.get_agent_position(i)) for i in self.enemies
+                  if state.get_agent_position(i) is not None and not state.get_agent_state(i).is_pacman]
+        if me.is_pacman and score < 0 and guards and len(self.trail) == self.trail.maxlen and len(set(self.trail)) <= 3:
+            g = min(guards, key=lambda q: self.dist(p, q))
+            return min(((q, a) for q, a in self.maze.edges[p] if a in legal), key=lambda e: self.dist(e[0], g))[1]
         defend = (self.guarding and not assist or emergency or visible_near) and not me.is_pacman
         if self.sortie:
             defend = emergency and not me.is_pacman
@@ -507,9 +514,10 @@ class CapturePlayer(CaptureAgent):
         score = self.get_score(state)
         returned = sum(state.get_agent_state(i).num_returned for i in self.agentsOnTeam)
         limit = 5 if score >= 0 else 7
-        # Both enemies invading leave their half unguarded: no carry cap, the trip checks still keep us safe.
+        # Both enemies invading leave their half unguarded: a big carry cap, the trip checks still keep us safe.
+        # Uncapped, the raider hoarded 20+ dots and got penned in when a guard came back.
         if all(state.get_agent_state(i).is_pacman for i in self.enemies):
-            limit = 99
+            limit = 16
         near_food = min((self.dist(p, q) for q in food), default=999)
         full_load = carried >= limit and (near_food > 1 or carried >= limit + 2)
         cash = carried and (
@@ -583,6 +591,9 @@ class CapturePlayer(CaptureAgent):
                 preference += 12
             if q in capsules:
                 preference -= capsule_bonus
+                # Everyone already scared: a second capsule now only wastes its fright.
+                if min(state.get_agent_state(i).scared_timer for i in self.enemies) > 10:
+                    preference += 20
             if mate not in maze.home and self.dist(mate, q) + 1 < self.dist(p, q):
                 preference += 4
             return preference
