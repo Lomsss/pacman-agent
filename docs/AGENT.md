@@ -79,6 +79,12 @@ python capture.py -r ../../../my_team.py -b baseline_team --redOpts "lookahead=1
   square the solution keeps. Capsules are the ones present at the start of
   the game. The solve takes under 0.2 s (jumboCapture, 301 home squares).
   `testing/check_contain.py` re-derives every position from the rules.
+- **`escape(capsules)`.** The raider's duel, the mirror of `contain`: our
+  pacman against one enemy ghost on its side. With the ghost to move,
+  `held[q * n + g]` is set when we can force our way home or onto a capsule
+  whatever the ghost does. Solved twice at setup, with the starting enemy
+  capsules and with none (used once any capsule is gone). Ignores food and
+  sight. `testing/check_escape.py` re-solves it by plain sweeps and compares.
 
 ### 2.2 `OpponentModel`: tracking
 
@@ -291,6 +297,17 @@ lands within 1 of it, take another legal step (or stop) that does not. Home
 squares and capsules count as safe. Among safe steps, prefer the least
 visited in `recent`, then the farthest from the ghost. If no step is safe,
 keep the plan.
+
+**Duel filter** (end of `choose_action`). A pacman carrying `ESC_MIN` (1) or
+more with exactly one awake ghost in sight (scared timer 2 or less) checks its
+step against `escape`: if the step leaves the ghost a forced catch and some
+other legal step does not, it takes the safe step closest to its goal. In 40
+losses to a 2Pac-style stand-in, 22 of 24 pacman deaths were such duels, at
+6 dots lost per death. Paired over 4 seed sets against three 2Pac stand-ins:
++0.089, +0.069, +0.041, +0.026 pts/game; 11-opponent field +0.000 +- 0.009.
+Applying it with nothing carried, or to an unseen guard at its likeliest
+square, scored less. Most remaining deaths start already lost when the
+guard comes into sight.
 
 ### 2.8 `defend`: the guard
 

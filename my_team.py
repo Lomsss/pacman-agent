@@ -14,6 +14,7 @@ from contest.util import nearest_point
 
 INF = float("inf")
 SIGHT = 5  # the engine shows an enemy within this Manhattan distance of either of us
+ESC_MIN = 1  # dots carried before the raider obeys the solved duel against a lone guard
 STEPS = ((1, 0, Directions.EAST), (-1, 0, Directions.WEST),
          (0, 1, Directions.NORTH), (0, -1, Directions.SOUTH))
 # Blue sees the map rotated by 180 degrees, so its first step to try is the
@@ -140,6 +141,46 @@ class Maze:
                         lost[k] = 1
                         queue.append((0, d, j))
         self.lost = lost
+
+    def escape(self, capsules):
+        """Solve our pacman against one enemy ghost on its side, the mirror of contain.
+        safe[q * n + g] is set when, with us to move from q and the ghost on g, we can
+        force our way home or onto a capsule (eaten before the catch check) whatever
+        the ghost does; held[q * n + g] the same with the ghost to move. Returns the
+        square index and held."""
+        away = self.order(p for p in self.edges if p not in self.home)
+        ix = {p: k for k, p in enumerate(away)}
+        n = len(away)
+        nbr = [[ix[q] for q, _ in self.edges[p] if q in ix] + [ix[p]] for p in away]
+        goal = [any(q in self.home or q in capsules for q, _ in self.edges[p]) for p in away]
+        safe = bytearray(n * n)      # us to move
+        held = bytearray(n * n)      # ghost to move, every reply leaves us safe
+        left = [len(nbr[g]) for q in range(n) for g in range(n)]
+        queue = deque()
+        for q in range(n):
+            if goal[q]:
+                for g in range(n):
+                    if g != q:
+                        safe[q * n + g] = 1
+                        queue.append((0, q, g))
+        while queue:
+            ghost_turn, q, g = queue.popleft()
+            if not ghost_turn:
+                # The ghost moved to g last: a ghost that was on any square next to g.
+                for h in nbr[g]:
+                    k = q * n + h
+                    if h != q and q not in nbr[h] and not held[k]:
+                        left[k] -= 1
+                        if not left[k]:
+                            held[k] = 1
+                            queue.append((1, q, h))
+            else:
+                for r in nbr[q]:
+                    k = r * n + g
+                    if r != g and not safe[k]:
+                        safe[k] = 1
+                        queue.append((0, r, g))
+        return ix, held
 
     def holds(self, d, i):
         """Our ghost's moves from d (staying included) after which an invader on i
@@ -338,6 +379,8 @@ class CapturePlayer(CaptureAgent):
         self.dist = self.maze.dist
         # shortcut: capsules eaten later still count as invader goals, which only makes holding stricter.
         self.maze.contain(set(self.get_capsules_you_are_defending(state)))
+        self.capsules0 = set(self.get_capsules(state))
+        self.escapes = {True: self.maze.escape(self.capsules0), False: self.maze.escape(set())}
         self.defended = self.resources(state)
         self.quota = (len(self.get_food(state).as_list()) +
                       len(self.get_food_you_are_defending(state).as_list())) / 2 - 2
@@ -445,6 +488,30 @@ class CapturePlayer(CaptureAgent):
         else:
             recall = self.guarding and bool(invaders) and me.scared_timer < 5 and not self.sortie
             action = self.raid(state, p, mate, estimates, legal, moves, recall or emergency)
+        # One awake ghost in sight: never step where it can force a catch, if a
+        # step exists from which we still force our way home (solved game).
+        if me.is_pacman and action in legal:
+            awake = [nearest_point(state.get_agent_position(i)) for i in self.enemies
+                     if state.get_agent_position(i) is not None and not state.get_agent_state(i).is_pacman
+                     and state.get_agent_state(i).scared_timer <= 2]
+            if len(awake) == 1 and me.num_carrying >= ESC_MIN:
+                caps = set(self.get_capsules(state))
+                ix, held = self.escapes[caps == self.capsules0]
+                g = ix.get(awake[0])
+                n = len(ix)
+
+                def ok(q):
+                    if q in self.maze.home or q in caps:
+                        return True
+                    return g is not None and q in ix and q != awake[0] and held[ix[q] * n + g]
+                steps = [(q, a) for q, a in self.maze.edges[p] + [(p, Directions.STOP)] if a in legal]
+                nxt = next(q for q, a in steps if a == action)
+                if not ok(nxt):
+                    good = [(q, a) for q, a in steps if ok(q)]
+                    if good:
+                        target = self.goal if self.goal in self.maze.edges else None
+                        action = min(good, key=lambda e: (self.dist(e[0], target) if target else 0,
+                                                          self.maze.bank[e[0]], self.maze.key[e[0]]))[1]
         return action if action in legal else legal[0]
 
     def raid(self, state, p, mate, estimates, legal, moves, recall):
