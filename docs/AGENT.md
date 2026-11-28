@@ -79,6 +79,12 @@ python capture.py -r ../../../my_team.py -b baseline_team --redOpts "lookahead=1
   square the solution keeps. Capsules are the ones present at the start of
   the game. The solve takes under 0.2 s (jumboCapture, 301 home squares).
   `testing/check_contain.py` re-derives every position from the rules.
+- **`escape(capsules)`.** The raider's duel, the mirror of `contain`: our
+  pacman against one enemy ghost on its side. With the ghost to move,
+  `held[q * n + g]` is set when we can force our way home or onto a capsule
+  whatever the ghost does. Solved twice at setup, with the starting enemy
+  capsules and with none (used once any capsule is gone). Ignores food and
+  sight. `testing/check_escape.py` re-solves it by plain sweeps and compares.
 
 ### 2.2 `OpponentModel`: tracking
 
@@ -133,6 +139,7 @@ left (300 at the start).
 | defend | `(guarding and not assist) or emergency or visible_near`, and only while we are a ghost. |
 | `recall` | Passed to `raid` for a sentinel out raiding when an invader appears and we are scared for less than 5, unless a `sortie` runs. `emergency` also recalls. |
 | `sortie` | A frozen board (score, our dots and their dots unchanged for 50 turns while an invader is on our side or our mate is across) is a tie at best. A sentinel that is level or behind with more than 100 moves left then raids for 100 turns; only `emergency` brings it back. It ends early once we lead. |
+| penned | A pacman that is behind, with its last 40 squares on 3 or fewer and a guard visible, walks into the nearest guard. A leader that walls our pacmen into a pocket wins by waiting (2Pac did it for 480 moves); respawning is the only way out. Runs before every other rule. |
 
 So the sentinel defends unless `assist` holds, and the raider defends only
 in emergencies or when a visible invader is within 2. A pacman never runs
@@ -150,9 +157,10 @@ a door-holding guard on defaultCapture. Food inside an enemy dead end gets
 mouth no more than one move after we get back out. With `lookahead`, forecast
 squares add `18 * probability`. Each repeat visit in `recent` adds 0.65.
 
-**When to bank.** `limit` is 5 when level or ahead, 7 when behind, and 99
-(no cap) while both enemies are pacmen: their half then has no defender, so
-only the trip checks below end a trip. With food carried, `cash` is true if any of these hold:
+**When to bank.** `limit` is 5 when level or ahead, 7 when behind, and 16
+while both enemies are pacmen: their half then has no defender. Uncapped (99)
+the raider hoarded 20+ dots and was penned in once a guard came back (2Pac
+proxy, 82 tournament maps). With food carried, `cash` is true if any of these hold:
 
 - what we returned plus what we carry reaches `quota` (half the total dots,
   minus 2);
@@ -180,7 +188,9 @@ extra(q) = danger[q] + 12 if within 3 of a taboo square
 
 `capsule_bonus` is 4 when fewer than 5 dots are left or some tracked enemy
 has scared timer below 7 (in practice almost always), otherwise 1. The 1.5
-bonus keeps the current goal unless another is clearly better.
+bonus keeps the current goal unless another is clearly better. A capsule
+pays +20 while every enemy is scared for more than 10: eating it then only
+wastes its fright (against 2Pac both our agents ate their capsules 2 moves apart).
 
 **Stand-off breaking.** `cycling` means the last five squares alternate
 A-B-A-B-A. When cycling, with a goal and the score level or behind:
@@ -250,7 +260,7 @@ Safety checks replay `survive` along the trip:
   scores only if every tracked replay survives. With no belief for some
   hidden defender (`blind`, e.g. `prediction=0`), trips over the limit are
   dropped (neither scored nor extended).
-  With both enemies on our side (`limit` 99) it never applies: an invader
+  With both enemies on our side (`limit` 16) it rarely applies: an invader
   must first cross back before it can defend again, and `watch` still sees it.
 - `back` tries the `TRIP_DOORS` (3) nearest doors and uses the first one all
   active replays survive. If none does, the trip does not score. With no
@@ -287,6 +297,17 @@ lands within 1 of it, take another legal step (or stop) that does not. Home
 squares and capsules count as safe. Among safe steps, prefer the least
 visited in `recent`, then the farthest from the ghost. If no step is safe,
 keep the plan.
+
+**Duel filter** (end of `choose_action`). A pacman carrying `ESC_MIN` (1) or
+more with exactly one awake ghost in sight (scared timer 2 or less) checks its
+step against `escape`: if the step leaves the ghost a forced catch and some
+other legal step does not, it takes the safe step closest to its goal. In 40
+losses to a 2Pac-style stand-in, 22 of 24 pacman deaths were such duels, at
+6 dots lost per death. Paired over 4 seed sets against three 2Pac stand-ins:
++0.089, +0.069, +0.041, +0.026 pts/game; 11-opponent field +0.000 +- 0.009.
+Applying it with nothing carried, or to an unseen guard at its likeliest
+square, scored less. Most remaining deaths start already lost when the
+guard comes into sight.
 
 ### 2.8 `defend`: the guard
 
@@ -367,7 +388,7 @@ Routes stay on our side (`routes(..., home_only=True)`, no risk).
 | Dead-end danger | slack <= 1, `min(16, 3 + 2d)` | Food in enemy pockets |
 | Forecast risk | 18 | Per unit reply probability |
 | Revisit cost | 0.65 | Per repeat in `recent` |
-| `limit` | 5 / 7 / 99 | Carry limit when level or ahead / behind / both enemies are pacmen |
+| `limit` | 5 / 7 / 16 | Carry limit when level or ahead / behind / both enemies are pacmen |
 | Cash rules | +8, 2, +3, `limit + 2` | Clock, door cost, far food, full load |
 | Exit pricing | ghosts scared <= 3, `3 * max(0, 2 - lead)`, window 0..1 | Door choice and early bank |
 | `capsule_bonus` | 4 / 1 | Fewer than 5 dots or an enemy scared < 7 |
